@@ -22,11 +22,8 @@ from PIL import Image
 
 from einops import rearrange, repeat
 
-from flux.util import load_flow_model, load_t5, load_clip, load_ae, configs as flux_configs
+from flux.util import load_flow_model, load_t5, load_clip, load_ae
 from flux.sampling import denoise, get_schedule, get_noise, unpack
-from flux.model import Flux
-from flux.modules.autoencoder import AutoEncoder
-from flux.modules.conditioner import HFEmbedder
 from utils.image_spliter import ImageSpliterTh
 
 
@@ -138,12 +135,6 @@ class FluxInferencer:
         self._cached_txt_ids = torch.zeros(1, self._cached_txt.shape[1], 3,
                                            dtype=torch.float32)
         print("✅ Prompt encoded.")
-
-    def encode_prompts(self, prompt, neg_prompt=""):
-        """编码 prompt，返回 cond（正）和 neg_cond（负）的对。
-        Flux 的 prepare() 在运行时完成实际编码，这里只保存文本。
-        """
-        return prompt, neg_prompt
 
     def do_sampling(self, packed_latent, packed_noise, img_ids,
                     txt, txt_ids, vec,
