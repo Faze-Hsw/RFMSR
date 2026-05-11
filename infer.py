@@ -8,11 +8,9 @@ Flux img2img 超分推理脚本
   3. 修改 configs/infer.yaml 可设置默认参数
 """
 
-import math
 import os
-
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
+import math
 import fire
 import numpy as np
 import torch

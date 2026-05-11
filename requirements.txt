@@ -7,4 +7,4 @@ fire
 pyyaml
 huggingface_hub>=0.23.0
 requests
-imwatermark>=0.1.0
+invisible-watermark

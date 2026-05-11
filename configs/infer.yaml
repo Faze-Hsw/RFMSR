@@ -21,7 +21,7 @@ t5_max_length: 512
 out_dir: outputs
 
 # 精度 - Flux 固定使用 bfloat16
-verbose: false
+verbose: true
 
 # 设备
 text_encoder_device: cuda  # T5+CLIP 所在设备
@@ -29,7 +29,7 @@ denoise_device: cuda       # Flux+VAE 所在设备
 
 # 分块推理（Chopping）参数 - 大图超分必选
 chopping:
-  enabled: false
+  enabled: true
   pch_size: 1024     # 分块 patch 边长（像素空间，需为 16 的倍数）
   stride_ratio: 0.5  # 滑窗步长比例，stride = pch_size × ratio
   extra_bs: 1        # 每次迭代并行处理的 patch 数量
