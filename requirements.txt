@@ -1,0 +1,10 @@
+torch>=2.1.0
+einops>=0.6
+numpy<2.0
+pillow
+safetensors>=0.3
+fire
+pyyaml
+huggingface_hub>=0.23.0
+requests
+imwatermark>=0.1.0

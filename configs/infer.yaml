@@ -1,0 +1,36 @@
+# Flux 超分推理配置
+# 参数优先级: CLI 参数 > 此配置文件 > 内置默认值
+
+# 模型名称: flux-dev, flux-schnell, flux-dev-canny, flux-dev-depth 等
+model_name: flux-dev
+
+# 质量引导 prompt（空字符串=不使用，或写固定正向描述）
+prompt: "Cinematic, high-contrast, photo-realistic, 8k, ultra HD, meticulous detailing, hyper sharpness, perfect without deformations"
+
+# 采样参数
+cfg: 3.5           # CFG 引导权重 (dev 推荐 2.5~4.0, schnell 忽略)
+steps: 28          # 采样步数 (dev 推荐 28~50, schnell 固定 4)
+seed: 42
+scale: 1.0          # 放大倍数，输出尺寸 = 原图 × scale
+start_timestep: 1.0 # 起始时间步 (0~1)，1.0=完全重绘，0.5=保留一半原图结构
+
+# T5 最大序列长度 (dev 推荐 512, schnell 推荐 256)
+t5_max_length: 512
+
+# 输出目录
+out_dir: outputs
+
+# 精度 - Flux 固定使用 bfloat16
+verbose: false
+
+# 设备
+text_encoder_device: cuda  # T5+CLIP 所在设备
+denoise_device: cuda       # Flux+VAE 所在设备
+
+# 分块推理（Chopping）参数 - 大图超分必选
+chopping:
+  enabled: false
+  pch_size: 1024     # 分块 patch 边长（像素空间，需为 16 的倍数）
+  stride_ratio: 0.5  # 滑窗步长比例，stride = pch_size × ratio
+  extra_bs: 1        # 每次迭代并行处理的 patch 数量
+  weight_type: Gaussian  # 融合权重: Gaussian / ones
