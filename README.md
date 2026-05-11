@@ -12,25 +12,47 @@
 
 ### 安装
 
+**Python 版本要求**：≥ 3.10（推荐 3.10 ~ 3.12）
+
 ```bash
-# 1. 进入项目目录
+# 0. (推荐) 创建虚拟环境
+#    使用 conda：
+conda create -n flux_sr python=3.12 -y
+conda activate flux_sr
+
+#    或使用 venv：
+# python -m venv .venv
+# .venv\Scripts\activate
+
+# 1. (可选) 先安装 PyTorch CUDA 版本（requirements.txt 默认装 CPU 版）
+#    根据你的 CUDA 版本选择，例如 CUDA 12.1：
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+#    如果 CUDA 版本不同，访问 https://pytorch.org 查看对应命令
+
+# 2. 进入项目目录
 cd d:/Projects/flux_sr
 
-# 2. 安装依赖
+# 3. 安装其余依赖
 pip install -r requirements.txt
 
-# 3. HuggingFace 认证
+# 4. HuggingFace 认证
 #    需要接受 Black Forest Labs 的模型协议
 #    访问 https://huggingface.co/black-forest-labs/FLUX.1-dev 并接受许可
 huggingface-cli login
 
-#    或者设置环境变量：
+#    或者设置环境变量（跳过交互式登录）：
 #    set HF_TOKEN=hf_xxxxxxxxxx
 
-# 4. （可选）配置镜像加速
+# 5. （可选）配置镜像加速
 #    在 infer.py 中已默认设置 HF_ENDPOINT=https://hf-mirror.com
 #    手动修改或删除该设置即可切换
+
+# 6. （可选）修改缓存路径，避免塞满 C 盘
+#    set HF_HOME=D:/huggingface_cache
 ```
+
+> **⚠️ 注意**：`requirements.txt` 中的 `torch>=2.1.0` 默认会安装 CPU 版 PyTorch，**务必先手动安装 CUDA 版 PyTorch**（上面第 1 步），否则推理会很慢或无法使用 GPU。
 
 ### 手动下载权重
 
