@@ -20,8 +20,10 @@ import torch.nn.functional as F
 import yaml
 from PIL import Image
 
+from einops import rearrange, repeat
+
 from flux.util import load_flow_model, load_t5, load_clip, load_ae, configs as flux_configs
-from flux.sampling import prepare, denoise, get_schedule, get_noise, unpack
+from flux.sampling import denoise, get_schedule, get_noise, unpack
 from flux.model import Flux
 from flux.modules.autoencoder import AutoEncoder
 from flux.modules.conditioner import HFEmbedder
@@ -123,6 +125,20 @@ class FluxInferencer:
             torch.cuda.empty_cache()
         print("✅ Text encoders freed.")
 
+    def prepare_conditions(self, prompt):
+        """使用 T5 + CLIP 编码 prompt，保存 txt/vec 到成员变量，不释放编码器。
+
+        调用方应在得到编码结果后手动调用 free_text_encoders() 释放显存。
+        """
+        print("Encoding prompt with T5 and CLIP...")
+        with torch.no_grad():
+            self._prompt_bs = 1
+            self._cached_txt = self.t5(prompt)   # [1, seq_len, 4096]
+            self._cached_vec = self.clip(prompt)  # [1, 768]
+        self._cached_txt_ids = torch.zeros(1, self._cached_txt.shape[1], 3,
+                                           dtype=torch.float32)
+        print("✅ Prompt encoded.")
+
     def encode_prompts(self, prompt, neg_prompt=""):
         """编码 prompt，返回 cond（正）和 neg_cond（负）的对。
         Flux 的 prepare() 在运行时完成实际编码，这里只保存文本。
@@ -221,15 +237,30 @@ class FluxInferencer:
         noise = get_noise(batch_size, h_pix, w_pix, device,
                           dtype=torch.bfloat16, seed=seed)
 
-        # 3) Prepare 条件（调用一次 T5，避免重复编码）
-        #    prepare() 接受 spatial latent → pack → 编码 prompt → 返回所有条件
+        # 3) Prepare 条件（使用预编码的 txt/vec，不重复调 T5/CLIP）
         with torch.no_grad():
-            inp = prepare(self.t5, self.clip, latent, prompt)
-        packed_latent = inp["img"]      # [B, seq_len, 64]
-        img_ids = inp["img_ids"]
-        txt = inp["txt"]
-        txt_ids = inp["txt_ids"]
-        vec = inp["vec"]
+            packed_latent = rearrange(
+                latent, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2
+            )
+
+            # img_ids: RoPE 位置编码
+            img_ids = torch.zeros(h_lat, w_lat, 3)
+            img_ids[..., 1] = img_ids[..., 1] + torch.arange(h_lat)[:, None]
+            img_ids[..., 2] = img_ids[..., 2] + torch.arange(w_lat)[None, :]
+            img_ids = repeat(img_ids, "h w c -> b (h w) c", b=batch_size)
+            img_ids = img_ids.to(device)
+
+            # 使用预编码的 txt/vec，按需要拓展 batch
+            txt = self._cached_txt
+            vec = self._cached_vec
+            txt_ids = self._cached_txt_ids
+            if batch_size > 1:
+                txt = repeat(txt, "1 ... -> bs ...", bs=batch_size)
+                vec = repeat(vec, "1 ... -> bs ...", bs=batch_size)
+                txt_ids = repeat(txt_ids, "1 ... -> bs ...", bs=batch_size)
+            txt = txt.to(device)
+            txt_ids = txt_ids.to(device)
+            vec = vec.to(device)
 
         # 手动 pack noise（与 prepare 内部相同的 rearrange）
         packed_noise = rearrange(
@@ -440,10 +471,12 @@ def main(
 
     inferencer = FluxInferencer()
 
-    # Phase 1: 加载文本编码器，编码 prompt 后立即释放
+    # Phase 1: 加载文本编码器 → 编码 prompt → 释放编码器显存
     inferencer.load_text_encoders(device=text_encoder_device, t5_max_length=t5_max_length)
+    inferencer.prepare_conditions(prompt)
+    inferencer.free_text_encoders()
 
-    # Phase 2: 加载 Flux + VAE
+    # Phase 2: 加载 Flux + VAE（此时 T5/CLIP 已释放，显存只供 Flux ~12GB）
     inferencer.load(model_name, verbose, denoise_device)
 
     # Phase 3: 推理
