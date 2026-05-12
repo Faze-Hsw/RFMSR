@@ -12,6 +12,16 @@ from transformers import (
 from safetensors.torch import load_file as load_sft
 
 
+def _from_pretrained_local_first(cls, *args, **kwargs):
+    """优先从本地 HF cache 加载，缓存没有再联网下载。"""
+    try:
+        return cls.from_pretrained(*args, **kwargs, local_files_only=True)
+    except Exception:
+        # 本地加载失败 → 联网下载
+        pass
+    return cls.from_pretrained(*args, **kwargs)
+
+
 class HFEmbedder(nn.Module):
     def __init__(self, version: str, max_length: int, ckpt_path: str | None = None, **hf_kwargs):
         super().__init__()
@@ -19,16 +29,14 @@ class HFEmbedder(nn.Module):
         self.max_length = max_length
         self.output_key = "pooler_output" if self.is_clip else "last_hidden_state"
 
-        # 1) Tokenizer（小文件，自动缓存/下载）
-        if self.is_clip:
-            self.tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(version, max_length=max_length)
-        else:
-            self.tokenizer: T5Tokenizer = T5Tokenizer.from_pretrained(version, max_length=max_length)
+        # 1) Tokenizer — 优先本地缓存，没有再联网下载
+        tok_cls = CLIPTokenizer if self.is_clip else T5Tokenizer
+        self.tokenizer = _from_pretrained_local_first(tok_cls, version, max_length=max_length)
 
-        # 2) 只加载架构 config（小文件），不下载大权重
-        config = AutoConfig.from_pretrained(version)
+        # 2) Config — 同上
+        config = _from_pretrained_local_first(AutoConfig, version)
         if self.is_clip:
-            self.hf_module: CLIPTextModel = CLIPTextModel._from_config(config)
+            self.hf_module: CLIPTextModel = CLIPTextModel._from_config(config.text_config)
         else:
             self.hf_module: T5EncoderModel = T5EncoderModel._from_config(config)
 
@@ -51,11 +59,19 @@ class HFEmbedder(nn.Module):
         else:
             state_dict = load_sft(ckpt_path, device="cpu")
 
+        # 本地 safetensors 的 key 可能带 text_model. 前缀，统一去掉
+        if self.is_clip:
+            state_dict = {k.removeprefix("text_model."): v for k, v in state_dict.items()}
+
         missing, unexpected = self.hf_module.load_state_dict(state_dict, strict=False)
         if missing:
             print(f"  ⚠️  本地权重加载缺少 {len(missing)} 个 key（部分未用）")
+            for k in missing[:10]:
+                print(f"     缺少: {k}")
         if unexpected:
             print(f"  ⚠️  本地权重有 {len(unexpected)} 个额外 key（已忽略）")
+            for k in unexpected[:10]:
+                print(f"     多余: {k}")
         print(f"  ✅ 从本地 safetensors 加载权重完成: {ckpt_path}")
 
     def forward(self, text: list[str]) -> Tensor:
