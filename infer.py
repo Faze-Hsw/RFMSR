@@ -149,7 +149,7 @@ class FluxInferencer:
             txt: T5 编码的文本
             txt_ids: 文本位置编码（全零）
             vec: CLIP 池化嵌入
-            timesteps: 完整时间步调度（从 1 到 0）
+            timesteps: 时间步调度（从 start_timestep 到 0）
             guidance: CFG 权重
             start_timestep: 起始时间 (0~1)，1.0=完全重绘，0.5=半保留原图
 
@@ -159,28 +159,21 @@ class FluxInferencer:
         device = packed_latent.device
         dtype = packed_latent.dtype
 
-        # 根据 start_timestep 确定截断后的调度和初始状态
+        # 初始状态：整流流插值 x = t * noise + (1-t) * latent
         if start_timestep < 1.0:
-            # 找到调度中最接近 start_timestep 的位置
-            t_vals = torch.tensor(timesteps, device=device)
-            idx = torch.argmin(torch.abs(t_vals - start_timestep)).item()
-            t = timesteps[idx]
-            # 截断调度：只从 t 到 0
-            truncated = timesteps[idx:]
-            # 初始状态：整流流插值 x = t * noise + (1-t) * latent
+            t = timesteps[0]  # 调度已从 start_timestep 开始，time_shift 后的首值
             img = t * packed_noise + (1.0 - t) * packed_latent
             self.print(f"   start_timestep={start_timestep:.2f}, t={t:.4f}, "
-                       f"steps: {len(timesteps)}→{len(truncated)}")
+                       f"steps: {len(timesteps) - 1}")
         else:
-            truncated = timesteps
             img = packed_noise  # 纯噪声
-            self.print(f"   完整去噪: {len(truncated) - 1} steps")
+            self.print(f"   完整去噪: {len(timesteps) - 1} steps")
 
         # 去噪
         result = denoise(
             self.model, img=img, img_ids=img_ids,
             txt=txt, txt_ids=txt_ids, vec=vec,
-            timesteps=truncated, guidance=guidance,
+            timesteps=timesteps, guidance=guidance,
         )
         return result
 
@@ -260,9 +253,9 @@ class FluxInferencer:
             noise, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2
         )
 
-        # 4) 获取时间步调度
+        # 4) 获取时间步调度（从 start_timestep 到 0，固定 steps 步）
         seq_len = packed_latent.shape[1]
-        timesteps = get_schedule(steps, seq_len, shift=True)
+        timesteps = get_schedule(steps, seq_len, start_timestep=start_timestep, shift=True)
 
         # 5) 去噪（内部处理 img2img 混合）
         packed_result = self.do_sampling(

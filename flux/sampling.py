@@ -291,12 +291,13 @@ def get_lin_function(
 def get_schedule(
     num_steps: int,
     image_seq_len: int,
+    start_timestep: float = 1.0,
     base_shift: float = 0.5,
     max_shift: float = 1.15,
     shift: bool = True,
 ) -> list[float]:
     # extra step for zero
-    timesteps = torch.linspace(1, 0, num_steps + 1)
+    timesteps = torch.linspace(start_timestep, 0, num_steps + 1)
 
     # shifting the schedule to favor high timesteps for higher signal images
     if shift:
