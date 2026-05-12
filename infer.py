@@ -52,6 +52,8 @@ STEPS = _CFG.get("steps", 28)
 SEED = _CFG.get("seed", 42)
 
 _WEIGHTS_CFG = _CFG.get("weights", {})
+T5XXL_PATH = _WEIGHTS_CFG.get("t5xxl", None)
+CLIP_PATH = _WEIGHTS_CFG.get("clip", None)
 OUTDIR = _CFG.get("out_dir", "outputs")
 VERBOSE = _CFG.get("verbose", False)
 SCALE = _CFG.get("scale", 1.0)
@@ -102,12 +104,13 @@ class FluxInferencer:
 
         print("✅ Models loaded.")
 
-    def load_text_encoders(self, device="cuda", t5_max_length=T5_MAX_LENGTH):
+    def load_text_encoders(self, device="cuda", t5_max_length=T5_MAX_LENGTH,
+                           t5xxl_path=None, clip_path=None):
         """在指定设备上加载 T5 + CLIP 文本编码器。"""
         print(f"Loading T5 ({torch.bfloat16}) -> {device}...")
-        self.t5 = load_t5(device, max_length=t5_max_length)
+        self.t5 = load_t5(device, max_length=t5_max_length, ckpt_path=t5xxl_path)
         print(f"Loading CLIP ({torch.bfloat16}) -> {device}...")
-        self.clip = load_clip(device)
+        self.clip = load_clip(device, ckpt_path=clip_path)
         print("✅ Text encoders loaded.")
 
     def free_text_encoders(self):
@@ -461,7 +464,8 @@ def main(
     inferencer = FluxInferencer()
 
     # Phase 1: 加载文本编码器 → 编码 prompt → 释放编码器显存
-    inferencer.load_text_encoders(device=text_encoder_device, t5_max_length=t5_max_length)
+    inferencer.load_text_encoders(device=text_encoder_device, t5_max_length=t5_max_length,
+                                  t5xxl_path=T5XXL_PATH, clip_path=CLIP_PATH)
     inferencer.prepare_conditions(prompt)
     inferencer.free_text_encoders()
 

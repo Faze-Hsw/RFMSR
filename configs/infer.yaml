@@ -4,6 +4,11 @@
 # 模型名称: flux-dev, flux-schnell, flux-dev-canny, flux-dev-depth 等
 model_name: flux-dev
 
+# 模型权重路径（单 safetensors 文件路径，跟 sd35_turbo 风格一致；不配置则从 HuggingFace 下载）
+weights:
+  t5xxl: checkpoints/t5xxl_fp16.safetensors     # T5-XXL 权重文件
+  clip: checkpoints/clip_l.safetensors           # CLIP 权重文件
+
 # 质量引导 prompt（空字符串=不使用，或写固定正向描述）
 prompt: "Cinematic, high-contrast, photo-realistic, 8k, ultra HD, meticulous detailing, hyper sharpness, perfect without deformations"
 
