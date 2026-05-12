@@ -690,15 +690,15 @@ def load_t5(device: str | torch.device = "cuda", max_length: int = 512,
             ckpt_path: str | None = None) -> HFEmbedder:
     # max length 64, 128, 256 and 512 should work (if your sequence is short enough)
     return HFEmbedder("google/t5-v1_1-xxl", max_length=max_length,
-                      ckpt_path=ckpt_path,
-                      torch_dtype=torch.bfloat16).to(device)
+                      ckpt_path=ckpt_path, device=device,
+                      torch_dtype=torch.bfloat16)
 
 
 def load_clip(device: str | torch.device = "cuda",
               ckpt_path: str | None = None) -> HFEmbedder:
     return HFEmbedder("openai/clip-vit-large-patch14", max_length=77,
-                      ckpt_path=ckpt_path,
-                      torch_dtype=torch.bfloat16).to(device)
+                      ckpt_path=ckpt_path, device=device,
+                      torch_dtype=torch.bfloat16)
 
 
 def load_ae(name: str, device: str | torch.device = "cuda") -> AutoEncoder:
@@ -712,6 +712,8 @@ def load_ae(name: str, device: str | torch.device = "cuda") -> AutoEncoder:
 
     print(f"Loading AE checkpoint: {ckpt_path}")
     sd = load_sft(ckpt_path, device=str(device))
+    # 统一转为 bfloat16，防止 checkpoint 中 bias float32 而 weight bfloat16 导致 dtype 不匹配
+    sd = {k: v.to(torch.bfloat16) if v.is_floating_point() else v for k, v in sd.items()}
     missing, unexpected = ae.load_state_dict(sd, strict=False, assign=True)
     print_load_warning(missing, unexpected)
     return ae

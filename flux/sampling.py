@@ -8,6 +8,7 @@ import torch
 from einops import rearrange, repeat
 from PIL import Image
 from torch import Tensor
+from tqdm import tqdm
 
 from .model import Flux
 from .modules.autoencoder import AutoEncoder
@@ -325,7 +326,8 @@ def denoise(
 ):
     # this is ignored for schnell
     guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
-    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+    steps = zip(timesteps[:-1], timesteps[1:])
+    for t_curr, t_prev in tqdm(steps, desc="Denoising", total=len(timesteps) - 1, leave=False):
         t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
         img_input = img
         img_input_ids = img_ids

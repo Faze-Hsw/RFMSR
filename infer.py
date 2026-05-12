@@ -174,7 +174,7 @@ class FluxInferencer:
         else:
             truncated = timesteps
             img = packed_noise  # 纯噪声
-            self.print(f"   完整去噪: {len(timesteps)} steps")
+            self.print(f"   完整去噪: {len(truncated) - 1} steps")
 
         # 去噪
         result = denoise(
@@ -235,10 +235,11 @@ class FluxInferencer:
                 latent, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2
             )
 
-            # img_ids: RoPE 位置编码
-            img_ids = torch.zeros(h_lat, w_lat, 3)
-            img_ids[..., 1] = img_ids[..., 1] + torch.arange(h_lat)[:, None]
-            img_ids[..., 2] = img_ids[..., 2] + torch.arange(w_lat)[None, :]
+            # img_ids: RoPE 位置编码（pack 后空间减半）
+            h_pack, w_pack = h_lat // 2, w_lat // 2
+            img_ids = torch.zeros(h_pack, w_pack, 3)
+            img_ids[..., 1] = img_ids[..., 1] + torch.arange(h_pack)[:, None]
+            img_ids[..., 2] = img_ids[..., 2] + torch.arange(w_pack)[None, :]
             img_ids = repeat(img_ids, "h w c -> b (h w) c", b=batch_size)
             img_ids = img_ids.to(device)
 
@@ -273,7 +274,7 @@ class FluxInferencer:
         )
 
         # 6) Unpack → VAE decode
-        spatial_result = unpack(packed_result.float(), h_pix, w_pix)
+        spatial_result = unpack(packed_result, h_pix, w_pix)
         result = self.vae_decode_tensor(spatial_result)
 
         return result

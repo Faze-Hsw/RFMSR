@@ -1,6 +1,7 @@
 import glob
 import os
 
+import torch
 from torch import Tensor, nn
 from transformers import (
     AutoConfig,
@@ -23,7 +24,8 @@ def _from_pretrained_local_first(cls, *args, **kwargs):
 
 
 class HFEmbedder(nn.Module):
-    def __init__(self, version: str, max_length: int, ckpt_path: str | None = None, **hf_kwargs):
+    def __init__(self, version: str, max_length: int, ckpt_path: str | None = None,
+                 device: str | torch.device = "cuda", **hf_kwargs):
         super().__init__()
         self.is_clip = version.startswith("openai")
         self.max_length = max_length
@@ -35,18 +37,21 @@ class HFEmbedder(nn.Module):
 
         # 2) Config — 同上
         config = _from_pretrained_local_first(AutoConfig, version)
-        if self.is_clip:
-            self.hf_module: CLIPTextModel = CLIPTextModel._from_config(config.text_config)
-        else:
-            self.hf_module: T5EncoderModel = T5EncoderModel._from_config(config)
+
+        # ⭐ 优化：在 meta device 上创建模型，避免 ~44GB CPU float32 随机初始化
+        with torch.device("meta"):
+            if self.is_clip:
+                self.hf_module: CLIPTextModel = CLIPTextModel._from_config(config.text_config)
+            else:
+                self.hf_module: T5EncoderModel = T5EncoderModel._from_config(config)
 
         self.hf_module = self.hf_module.eval().requires_grad_(False)
 
-        # 3) 从本地 safetensors 覆盖权重（核心：大权重不走网络）
+        # 3) 从本地 safetensors 覆盖权重（直接加载到目标设备）
         if ckpt_path is not None and os.path.exists(ckpt_path):
-            self._load_local_weights(ckpt_path)
+            self._load_local_weights(ckpt_path, device)
 
-    def _load_local_weights(self, ckpt_path: str):
+    def _load_local_weights(self, ckpt_path: str, device: str = "cpu"):
         """从本地 safetensors 文件加载权重（支持单文件或分片目录）"""
         if os.path.isdir(ckpt_path):
             files = sorted(glob.glob(os.path.join(ckpt_path, "*.safetensors")))
@@ -55,15 +60,16 @@ class HFEmbedder(nn.Module):
                 return
             state_dict = {}
             for f in files:
-                state_dict.update(load_sft(f, device="cpu"))
+                state_dict.update(load_sft(f, device=device))
         else:
-            state_dict = load_sft(ckpt_path, device="cpu")
+            state_dict = load_sft(ckpt_path, device=device)
 
         # 本地 safetensors 的 key 可能带 text_model. 前缀，统一去掉
         if self.is_clip:
             state_dict = {k.removeprefix("text_model."): v for k, v in state_dict.items()}
 
-        missing, unexpected = self.hf_module.load_state_dict(state_dict, strict=False)
+        # ⭐ assign=True：直接以 state_dict 的 tensor 作为模型参数，跳过额外拷贝
+        missing, unexpected = self.hf_module.load_state_dict(state_dict, strict=False, assign=True)
         if missing:
             print(f"  ⚠️  本地权重加载缺少 {len(missing)} 个 key（部分未用）")
             for k in missing[:10]:
