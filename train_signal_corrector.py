@@ -25,7 +25,6 @@ from einops import rearrange, repeat
 from torch.amp import GradScaler, autocast
 
 from datapipe.train_dataloader import create_train_dataloader
-from flux.sampling import get_noise
 from flux.util import load_flow_model, load_t5, load_clip, load_ae
 from models.signal_corrector import SignalCorrector, create_signal_corrector
 
@@ -142,12 +141,17 @@ class SignalCorrectorTrainer:
 
     def _build_dataloader(self):
         dcfg = self.cfg["data"]
+        gt_size = dcfg["gt_size"]
+        assert gt_size % 16 == 0, (
+            f"gt_size={gt_size} 必须能被 16 整除 "
+            f"(VAE 8x 下采样 + pack 2x 重排)"
+        )
         self.dataloader = create_train_dataloader(
             data_dir=dcfg["hr_dir"],
             config_path=dcfg["degradation_config"],
             batch_size=dcfg["batch_size"],
             num_workers=dcfg["num_workers"],
-            gt_size=dcfg["gt_size"],
+            gt_size=gt_size,
             use_hflip=dcfg.get("use_hflip", True),
             use_rot=dcfg.get("use_rot", False),
         )
@@ -171,7 +175,10 @@ class SignalCorrectorTrainer:
         print(f"Iterations : {self.cfg['training']['iterations']}")
         print(f"Batch size : {self.cfg['data']['batch_size']}")
         print(f"LR         : {self.cfg['training']['lr']}")
-        print(f"t range    : [{self.cfg['training']['t_min']}, {self.cfg['training']['t_max']}]")
+        logit_mean = self.cfg['training'].get('logit_normal_mean', 0.0)
+        logit_std = self.cfg['training'].get('logit_normal_std', 1.0)
+        print(f"LogitNorm  : μ={logit_mean}, σ={logit_std}")
+        print(f"GT size    : {self.cfg['data']['gt_size']}")
         print(f"AMP        : {self.use_amp}")
         print(f"EMA rate   : {self.ema_rate}")
         print("=" * 60 + "\n")
