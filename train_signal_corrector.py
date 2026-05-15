@@ -40,7 +40,7 @@ class SignalCorrectorTrainer:
         with open(config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
 
-        self.device = torch.device(self.cfg["flux"]["device"])
+        self.device = torch.device(self.cfg["flux"]["denoise_device"])
         self._setup_seed(self.cfg["training"]["seed"])
 
         # ---- 实验目录 ----
@@ -99,21 +99,25 @@ class SignalCorrectorTrainer:
         print("✅ Flux + VAE loaded (frozen).")
 
     def _encode_prompt(self):
-        """加载 T5+CLIP → 编码固定 prompt → 缓存 → 释放编码器。"""
+        """加载 T5+CLIP → 编码固定 prompt → 缓存到 denoise_device → 释放编码器。"""
         flux_cfg = self.cfg["flux"]
-        device = self.device
+        te_device = torch.device(flux_cfg.get("text_encoder_device", "cuda"))
         prompt = flux_cfg["prompt"]
+        t5_max_length = flux_cfg.get("t5_max_length", 512)
+        weights = flux_cfg.get("weights", {})
+        t5_path = weights.get("t5xxl")
+        clip_path = weights.get("clip")
 
-        print("Loading T5 + CLIP ...")
-        t5 = load_t5(device, max_length=512)
-        clip = load_clip(device)
+        print(f"Loading T5 + CLIP -> {te_device} ...")
+        t5 = load_t5(te_device, max_length=t5_max_length, ckpt_path=t5_path)
+        clip = load_clip(te_device, ckpt_path=clip_path)
 
         print(f"Encoding prompt: '{prompt[:60]}...'")
         with torch.no_grad():
-            self.cached_txt = t5(prompt)          # [1, seq, 4096]
-            self.cached_vec = clip(prompt)         # [1, 768]
+            self.cached_txt = t5(prompt).to(self.device)       # [1, seq, 4096]
+            self.cached_vec = clip(prompt).to(self.device)      # [1, 768]
         self.cached_txt_ids = torch.zeros(
-            1, self.cached_txt.shape[1], 3, dtype=torch.float32, device=device,
+            1, self.cached_txt.shape[1], 3, dtype=torch.float32, device=self.device,
         )
 
         # 释放显存
@@ -247,8 +251,10 @@ class SignalCorrectorTrainer:
         z_hr = z_hr.detach().float()
         z_lr = z_lr.detach().float()
 
-        # 2. 采样时间步 t 和噪声 ε
-        t = torch.empty(bs, device=device).uniform_(tcfg["t_min"], tcfg["t_max"])
+        # 2. 采样时间步 t（Logit-Normal 分布，与 SD3/Flux 预训练一致）和噪声 ε
+        logit_mean = tcfg.get("logit_normal_mean", 0.0)
+        logit_std = tcfg.get("logit_normal_std", 1.0)
+        t = torch.sigmoid(torch.randn(bs, device=device) * logit_std + logit_mean)
         eps = torch.randn_like(z_hr)
 
         # 3. 信号修正

@@ -8,8 +8,8 @@ data:
   hr_dir: /path/to/hr_images
   degradation_config: configs/realesrgan_degradation.yaml
   gt_size: 512
-  batch_size: 4
-  num_workers: 4
+  batch_size: 16
+  num_workers: 12
   use_hflip: true
   use_rot: false
 
@@ -18,23 +18,30 @@ flux:
   model_name: flux-dev
   prompt: "Cinematic, high-contrast, photo-realistic, 8k, ultra HD, meticulous detailing, hyper sharpness, perfect without deformations"
   guidance: 3.5
-  device: cuda
+  text_encoder_device: cuda    # T5+CLIP 所在设备（编码后释放）
+  denoise_device: cuda         # Flux+VAE 所在设备
+  weights:
+    t5xxl: checkpoints/t5xxl_fp16.safetensors
+    clip: checkpoints/clip_l.safetensors
+  t5_max_length: 512
 
 # ---- 训练 ----
 training:
   iterations: 100000
-  lr: 1.0e-4
-  weight_decay: 1.0e-2
+  lr: 5.0e-5
+  weight_decay: 0
   gradient_clip: 1.0
   use_amp: true
-  ema_rate: 0.999
-  t_min: 0.2
-  t_max: 0.8
+  ema_rate: 0.99
+  # 时间步采样：Logit-Normal 分布 t = sigmoid(N(mean, std²))
+  # mean=0, std=1 → 集中在 t≈0.5 附近，自然减少极端值
+  logit_normal_mean: 0.0
+  logit_normal_std: 1.0
   seed: 42
 
 # ---- 日志 & 保存 ----
 experiment:
-  name: signal_corrector_v1
-  save_dir: experiments/signal_corrector_v1
-  log_freq: 200
+  name: signal_corrector
+  save_dir: experiments/signal_corrector
+  log_freq: 1000
   save_freq: 5000
