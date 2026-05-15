@@ -1,0 +1,12 @@
+# Signal Corrector Δ_φ 模型架构超参数
+# 基于 Flux SingleStreamBlock 的轻量 DiT
+
+in_channels: 64           # packed latent dim (16 latent_ch × 2×2 patch)
+out_channels: 64
+hidden_size: 768
+num_heads: 12
+depth: 12                 # SingleStreamBlock 层数
+mlp_ratio: 4.0
+axes_dim: [4, 30, 30]    # RoPE 维度分配，sum = hidden_size / num_heads = 64
+theta: 10000
+qkv_bias: true
