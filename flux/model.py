@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from flux.modules.layers import (
     DoubleStreamBlock,
@@ -81,6 +82,10 @@ class Flux(nn.Module):
 
         self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
 
+        # 梯度检查点开关
+        self.gradient_checkpointing = False
+        self.gradient_checkpointing_chunk = 3  # 每 N 个 block 一组
+
     def forward(
         self,
         img: Tensor,
@@ -107,13 +112,43 @@ class Flux(nn.Module):
         ids = torch.cat((txt_ids, img_ids), dim=1)
         pe = self.pe_embedder(ids)
 
-        for block in self.double_blocks:
-            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+        # ===== Block forward with configurable per-group gradient checkpointing =====
+        if self.training and self.gradient_checkpointing:
+            CHUNK = self.gradient_checkpointing_chunk
 
-        img = torch.cat((txt, img), 1)
-        for block in self.single_blocks:
-            img = block(img, vec=vec, pe=pe)
-        img = img[:, txt.shape[1] :, ...]
+            for i in range(0, len(self.double_blocks), CHUNK):
+                _blocks = self.double_blocks[i:i + CHUNK]
+                def _run_double(img, txt, _vec=vec, _pe=pe, __blocks=_blocks):
+                    for b in __blocks:
+                        img, txt = b(img=img, txt=txt, vec=_vec, pe=_pe)
+                    return img, txt
+                img, txt = checkpoint(
+                    _run_double, img, txt,
+                    use_reentrant=False, preserve_rng_state=False,
+                )
+
+            img = torch.cat((txt, img), 1)
+
+            for i in range(0, len(self.single_blocks), CHUNK):
+                _blocks = self.single_blocks[i:i + CHUNK]
+                def _run_single(img, _vec=vec, _pe=pe, __blocks=_blocks):
+                    for b in __blocks:
+                        img = b(img, vec=_vec, pe=_pe)
+                    return img
+                img = checkpoint(
+                    _run_single, img,
+                    use_reentrant=False, preserve_rng_state=False,
+                )
+
+            img = img[:, txt.shape[1] :, ...]
+        else:
+            for block in self.double_blocks:
+                img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+            img = torch.cat((txt, img), 1)
+            for block in self.single_blocks:
+                img = block(img, vec=vec, pe=pe)
+            img = img[:, txt.shape[1] :, ...]
+        # ===== End block forward =====
 
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
         return img

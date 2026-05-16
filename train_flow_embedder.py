@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import yaml
 from einops import rearrange, repeat
 from torch.amp import GradScaler, autocast
+from tqdm import tqdm
 
 from datapipe.train_dataloader import create_train_dataloader
 from flux.util import load_flow_model, load_t5, load_clip, load_ae
@@ -49,6 +50,10 @@ class FlowEmbedderTrainer:
 
         self.log_freq = exp["log_freq"]
         self.save_freq = exp["save_freq"]
+
+        # ---- 梯度检查点开关（需在 _load_flux 前设置） ----
+        self.use_gradient_checkpointing = self.cfg["training"].get("use_gradient_checkpointing", True)
+        self.gradient_checkpointing_chunk = self.cfg["training"].get("gradient_checkpointing_chunk", 3)
 
         # ---- 加载各模块 ----
         self._load_flux()
@@ -86,8 +91,10 @@ class FlowEmbedderTrainer:
 
         print(f"Loading Flux '{name}' -> {device} ...")
         self.flux = load_flow_model(name, device=device, verbose=False)
-        self.flux.eval()
         self.flux.requires_grad_(False)
+        # 保持 train() 模式：让 Flux.forward 中的 self.training=True，
+        # 否则梯段检查点的条件 self.training and self.gradient_checkpointing 永不为真
+        self.flux.train()
 
         print(f"Loading VAE -> {device} ...")
         self.ae = load_ae(name, device=device)
@@ -95,12 +102,18 @@ class FlowEmbedderTrainer:
         self.ae.requires_grad_(False)
 
         self.guidance = flux_cfg["guidance"]
+        self.flux.gradient_checkpointing = self.use_gradient_checkpointing
+        self.flux.gradient_checkpointing_chunk = self.gradient_checkpointing_chunk
+        d_groups = (19 + self.gradient_checkpointing_chunk - 1) // self.gradient_checkpointing_chunk
+        s_groups = (38 + self.gradient_checkpointing_chunk - 1) // self.gradient_checkpointing_chunk
+        print(f"  training={self.flux.training} | grad_cp={self.flux.gradient_checkpointing} | chunk={self.flux.gradient_checkpointing_chunk} | {d_groups}D+{s_groups}S groups")
+        print(f"  Flux params: {sum(p.numel() for p in self.flux.parameters())/1e9:.2f}B → {sum(p.numel() for p in self.flux.parameters())*2/1e9:.2f} GB (bf16)")
         print("✅ Flux + VAE loaded (frozen).")
 
     def _encode_prompt(self):
         """加载 T5+CLIP → 编码固定 prompt → 缓存到 denoise_device → 释放编码器。"""
         flux_cfg = self.cfg["flux"]
-        te_device = torch.device(flux_cfg.get("text_encoder_device", "cuda"))
+        te_device = flux_cfg.get("text_encoder_device", "cuda")  # 保持字符串，与 infer.py 一致
         prompt = flux_cfg["prompt"]
         t5_max_length = flux_cfg.get("t5_max_length", 512)
         weights = flux_cfg.get("weights", {})
@@ -180,6 +193,12 @@ class FlowEmbedderTrainer:
         print(f"LogitNorm  : μ={logit_mean}, σ={logit_std}")
         print(f"GT size    : {self.cfg['data']['gt_size']}")
         print(f"AMP        : {self.use_amp}")
+        print(f"GradCP     : {self.use_gradient_checkpointing} | chunk={self.gradient_checkpointing_chunk}", end="")
+        if self.use_gradient_checkpointing and hasattr(self, 'flux'):
+            d_groups = (19 + self.gradient_checkpointing_chunk - 1) // self.gradient_checkpointing_chunk
+            s_groups = (38 + self.gradient_checkpointing_chunk - 1) // self.gradient_checkpointing_chunk
+            print(f" | {d_groups}D+{s_groups}S groups", end="")
+        print()
         print(f"EMA rate   : {self.ema_rate}")
         print("=" * 60 + "\n")
 
@@ -213,29 +232,38 @@ class FlowEmbedderTrainer:
     # 单步 Flux 前向（保留 x_t 的梯度图）
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _flux_forward_no_args(
+        flux, x_t_packed, img_ids, txt, txt_ids, t_vec, vec, guidance_vec,
+    ) -> torch.Tensor:
+        """纯位置参数包装，供 checkpoint 调用。"""
+        return flux(
+            img=x_t_packed, img_ids=img_ids,
+            txt=txt, txt_ids=txt_ids,
+            timesteps=t_vec, y=vec, guidance=guidance_vec,
+        )
+
     def flux_velocity(
         self, x_t_packed: torch.Tensor, t: torch.Tensor,
         img_ids: torch.Tensor, bs: int,
     ) -> torch.Tensor:
-        """冻结 Flux 单步前向，返回 velocity 预测 [B, seq, 64]。"""
-        # 文本条件扩展到 batch
-        txt = self.cached_txt.expand(bs, -1, -1).to(self.device)
+        """冻结 Flux 单步前向，返回 velocity 预测 [B, seq, 64]。
+
+        梯度检查点已在 Flux.forward 内部按 block 分组实现，
+        这里直接调用 Flux 即可。
+        """
+        # 对齐到 Flux 权重的 dtype (bf16)，移出 autocast 后不再自动转换
+        flux_dtype = x_t_packed.dtype
+        txt = self.cached_txt.expand(bs, -1, -1).to(self.device, dtype=flux_dtype)
         txt_ids = self.cached_txt_ids.expand(bs, -1, -1).to(self.device)
-        vec = self.cached_vec.expand(bs, -1).to(self.device)
+        vec = self.cached_vec.expand(bs, -1).to(self.device, dtype=flux_dtype)
 
-        t_vec = t.to(self.device)
-        guidance_vec = torch.full((bs,), self.guidance, device=self.device, dtype=x_t_packed.dtype)
+        t_vec = t.to(self.device, dtype=flux_dtype)
+        guidance_vec = torch.full((bs,), self.guidance, device=self.device, dtype=flux_dtype)
 
-        v_pred = self.flux(
-            img=x_t_packed,
-            img_ids=img_ids,
-            txt=txt,
-            txt_ids=txt_ids,
-            timesteps=t_vec,
-            y=vec,
-            guidance=guidance_vec,
+        return self._flux_forward_no_args(
+            self.flux, x_t_packed, img_ids, txt, txt_ids, t_vec, vec, guidance_vec,
         )
-        return v_pred
 
     # ------------------------------------------------------------------
     # Training step
@@ -264,7 +292,7 @@ class FlowEmbedderTrainer:
         t = torch.sigmoid(torch.randn(bs, device=device) * logit_std + logit_mean)
         eps = torch.randn_like(z_hr)
 
-        # 3. Flow Embedder 前向
+        # 3. Flow Embedder 前向（在 AMP 下，它对精度敏感）
         with autocast(device_type="cuda", enabled=self.use_amp):
             delta = self.embedder(z_lr, t)               # [B,16,64,64]
             z_corrected = z_lr + delta
@@ -273,19 +301,24 @@ class FlowEmbedderTrainer:
             t_expand = t[:, None, None, None]              # [B,1,1,1]
             x_t = (1.0 - t_expand) * z_corrected + t_expand * eps
 
-            # 5. pack → Flux 前向
-            x_t_packed = self.pack(x_t.to(torch.bfloat16))
-            _, _, h_lat, w_lat = z_hr.shape
-            img_ids = self.make_img_ids(bs, h_lat // 2, w_lat // 2, device)
+        # 5. Flux 前向（Flux 权重已冻结 + bf16，AMP 无帮助反而可能引起精度问题）
+        x_t_packed = self.pack(x_t.to(torch.bfloat16))
+        _, _, h_lat, w_lat = z_hr.shape
+        img_ids = self.make_img_ids(bs, h_lat // 2, w_lat // 2, device)
 
-            v_pred = self.flux_velocity(x_t_packed, t, img_ids, bs)
+        v_pred = self.flux_velocity(x_t_packed, t, img_ids, bs)
 
-            # 6. 目标 velocity
-            v_target = eps - z_hr                          # [B,16,64,64]
-            v_target_packed = self.pack(v_target.to(torch.bfloat16))
+        # 6. 目标 velocity
+        v_target = eps - z_hr                          # [B,16,64,64]
+        v_target_packed = self.pack(v_target.to(torch.bfloat16))
 
-            # 7. Loss
-            loss = F.mse_loss(v_pred.float(), v_target_packed.float())
+        # 7. Loss（NaN 诊断）
+        loss = F.mse_loss(v_pred.float(), v_target_packed.float())
+        if torch.isnan(loss):
+            for name, t in [("delta", delta), ("x_t", x_t), ("v_pred", v_pred), ("v_target", v_target)]:
+                has_nan = torch.isnan(t).any().item()
+                has_inf = torch.isinf(t).any().item()
+                print(f"  ⚠️  {name}: nan={has_nan} inf={has_inf}  min={t.min().item():.3f} max={t.max().item():.3f}")
 
         # 8. Backward
         self.optimizer.zero_grad()
@@ -370,38 +403,59 @@ class FlowEmbedderTrainer:
         self.embedder.train()
 
         data_iter = iter(self.dataloader)
-        t0 = time.time()
 
-        while self.global_step < total_iters:
-            # 无限循环 dataloader
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(self.dataloader)
-                batch = next(data_iter)
+        pbar = tqdm(
+            total=total_iters,
+            initial=self.global_step,
+            desc="Train",
+            unit="step",
+            bar_format="{desc} [{n:>6d}/{total_fmt}] {percentage:3.0f}% |{bar}| loss={postfix} [{rate:>4.0f}it/s]",
+        )
 
-            loss_dict = self.train_step(batch)
-            self.global_step += 1
+        # 累计损失，每 log_freq 步输出一次平均值
+        loss_ema = 0.0
+        loss_cnt = 0
 
-            # 日志
-            if self.global_step % self.log_freq == 0:
-                elapsed = time.time() - t0
-                speed = self.log_freq / elapsed
-                print(
-                    f"[step {self.global_step}/{total_iters}] "
-                    f"loss={loss_dict['loss']:.6f}  "
-                    f"lr={self.optimizer.param_groups[0]['lr']:.2e}  "
-                    f"{speed:.1f} it/s"
-                )
-                t0 = time.time()
+        try:
+            while self.global_step < total_iters:
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(self.dataloader)
+                    batch = next(data_iter)
 
-            # 保存
-            if self.global_step % self.save_freq == 0:
-                self.save_checkpoint(self.global_step)
+                loss_dict = self.train_step(batch)
+                self.global_step += 1
 
-        # 最终保存
-        self.save_checkpoint(self.global_step)
-        print("🎉 Training finished!")
+                loss_ema += loss_dict["loss"]
+                loss_cnt += 1
+
+                # 进度条显示当前步 loss
+                pbar.set_postfix_str(f"{loss_dict['loss']:.6f}")
+                pbar.update(1)
+
+                # 每 log_freq 步输出平均损失
+                if self.global_step % self.log_freq == 0:
+                    avg_loss = loss_ema / loss_cnt
+                    lr = self.optimizer.param_groups[0]['lr']
+                    tqdm.write(
+                        f"[step {self.global_step}/{total_iters}] "
+                        f"avg_loss={avg_loss:.6f}  lr={lr:.2e}"
+                    )
+                    loss_ema = 0.0
+                    loss_cnt = 0
+
+                if self.global_step % self.save_freq == 0:
+                    self.save_checkpoint(self.global_step)
+
+            self.save_checkpoint(self.global_step)
+            pbar.close()
+            print("Training finished!")
+        except KeyboardInterrupt:
+            pbar.close()
+            print("\nInterrupted, saving checkpoint ...")
+            self.save_checkpoint(self.global_step)
+            print("Checkpoint saved on interrupt.")
 
 
 # =========================================================================

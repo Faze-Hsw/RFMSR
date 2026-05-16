@@ -5,10 +5,10 @@ model_config: configs/flow_embedder.yaml
 
 # ---- 数据 ----
 data:
-  hr_dir: /path/to/hr_images
+  hr_dir: traindata/
   degradation_config: configs/realesrgan_degradation.yaml
   gt_size: 512
-  batch_size: 16
+  batch_size: 8
   num_workers: 12
   use_hflip: true
   use_rot: false
@@ -38,10 +38,12 @@ training:
   logit_normal_mean: 0.0
   logit_normal_std: 1.0
   seed: 42
+  use_gradient_checkpointing: true     
+  gradient_checkpointing_chunk: 3      
 
 # ---- 日志 & 保存 ----
 experiment:
   name: flow_embedder
   save_dir: experiments/flow_embedder
   log_freq: 1000
-  save_freq: 5000
+  save_freq: 1000
