@@ -1,1 +1,1 @@
-from .signal_corrector import SignalCorrector, create_signal_corrector
+from .flow_embedder import FlowEmbedder, create_flow_embedder

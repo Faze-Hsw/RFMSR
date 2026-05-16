@@ -1,7 +1,7 @@
-# Signal Corrector Δ_φ 训练配置
+# Flow Embedder 训练配置
 
 # ---- 模型架构（引用外部配置） ----
-model_config: configs/signal_corrector.yaml
+model_config: configs/flow_embedder.yaml
 
 # ---- 数据 ----
 data:
@@ -27,7 +27,7 @@ flux:
 
 # ---- 训练 ----
 training:
-  iterations: 100000
+  iterations: 500000
   lr: 5.0e-5
   weight_decay: 0
   gradient_clip: 1.0
@@ -41,7 +41,7 @@ training:
 
 # ---- 日志 & 保存 ----
 experiment:
-  name: signal_corrector
-  save_dir: experiments/signal_corrector
+  name: flow_embedder
+  save_dir: experiments/flow_embedder
   log_freq: 1000
   save_freq: 5000

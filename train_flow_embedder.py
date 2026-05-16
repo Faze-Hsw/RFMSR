@@ -1,12 +1,12 @@
 """
-Signal Corrector Δ_φ 训练脚本
+Flow Embedder Δ_φ 训练脚本
 
-训练目标: 让冻结 Flux 在修正后的嵌入点上预测出正确的 velocity
+训练目标: 让冻结 Flux 在 FlowEmbedder 修正后的嵌入点上预测出正确的 velocity
 Loss = MSE( v_θ(x_t, t) , ε - z_HR )
 其中 x_t = (1-t) * (z_LR + Δ_φ(z_LR, t)) + t * ε
 
 用法:
-  python train_signal_corrector.py --config configs/train_signal_corrector.yaml
+  python train_flow_embedder.py --config configs/train_flow_embedder.yaml
 """
 
 import argparse
@@ -26,14 +26,14 @@ from torch.amp import GradScaler, autocast
 
 from datapipe.train_dataloader import create_train_dataloader
 from flux.util import load_flow_model, load_t5, load_clip, load_ae
-from models.signal_corrector import SignalCorrector, create_signal_corrector
+from models.flow_embedder import FlowEmbedder, create_flow_embedder
 
 
 # =========================================================================
 # Trainer
 # =========================================================================
 
-class SignalCorrectorTrainer:
+class FlowEmbedderTrainer:
 
     def __init__(self, config_path: str):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -53,7 +53,7 @@ class SignalCorrectorTrainer:
         # ---- 加载各模块 ----
         self._load_flux()
         self._encode_prompt()
-        self._build_corrector()
+        self._build_embedder()
         self._build_optimizer()
         self._build_dataloader()
         self._build_ema()
@@ -124,17 +124,17 @@ class SignalCorrectorTrainer:
         torch.cuda.empty_cache()
         print("✅ Prompt encoded, T5+CLIP released.")
 
-    def _build_corrector(self):
-        """创建可训练的信号修正器 Δ_φ。"""
+    def _build_embedder(self):
+        """创建可训练的 Flow Embedder Δ_φ。"""
         cfg_path = self.cfg["model_config"]
-        self.corrector = create_signal_corrector(cfg_path).to(self.device)
-        n_params = sum(p.numel() for p in self.corrector.parameters())
-        print(f"✅ SignalCorrector created: {n_params / 1e6:.2f}M params")
+        self.embedder = create_flow_embedder(cfg_path).to(self.device)
+        n_params = sum(p.numel() for p in self.embedder.parameters())
+        print(f"✅ FlowEmbedder created: {n_params / 1e6:.2f}M params")
 
     def _build_optimizer(self):
         tcfg = self.cfg["training"]
         self.optimizer = torch.optim.AdamW(
-            self.corrector.parameters(),
+            self.embedder.parameters(),
             lr=tcfg["lr"],
             weight_decay=tcfg["weight_decay"],
         )
@@ -162,7 +162,7 @@ class SignalCorrectorTrainer:
         if rate > 0:
             self.ema_rate = rate
             self.ema_state = OrderedDict(
-                {k: deepcopy(v.data) for k, v in self.corrector.state_dict().items()}
+                {k: deepcopy(v.data) for k, v in self.embedder.state_dict().items()}
             )
         else:
             self.ema_rate = 0
@@ -264,9 +264,9 @@ class SignalCorrectorTrainer:
         t = torch.sigmoid(torch.randn(bs, device=device) * logit_std + logit_mean)
         eps = torch.randn_like(z_hr)
 
-        # 3. 信号修正
+        # 3. Flow Embedder 前向
         with autocast(device_type="cuda", enabled=self.use_amp):
-            delta = self.corrector(z_lr, t)               # [B,16,64,64]
+            delta = self.embedder(z_lr, t)               # [B,16,64,64]
             z_corrected = z_lr + delta
 
             # 4. 构造嵌入点 x_t
@@ -294,7 +294,7 @@ class SignalCorrectorTrainer:
             if tcfg["gradient_clip"] > 0:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    self.corrector.parameters(), tcfg["gradient_clip"],
+                    self.embedder.parameters(), tcfg["gradient_clip"],
                 )
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -302,7 +302,7 @@ class SignalCorrectorTrainer:
             loss.backward()
             if tcfg["gradient_clip"] > 0:
                 torch.nn.utils.clip_grad_norm_(
-                    self.corrector.parameters(), tcfg["gradient_clip"],
+                    self.embedder.parameters(), tcfg["gradient_clip"],
                 )
             self.optimizer.step()
 
@@ -319,7 +319,7 @@ class SignalCorrectorTrainer:
     def _update_ema(self):
         if self.ema_state is None:
             return
-        for k, v in self.corrector.state_dict().items():
+        for k, v in self.embedder.state_dict().items():
             if v.is_floating_point():
                 self.ema_state[k].mul_(self.ema_rate).add_(v.data, alpha=1 - self.ema_rate)
             else:
@@ -333,14 +333,14 @@ class SignalCorrectorTrainer:
         ckpt_dir = self.exp_dir / "checkpoints"
 
         # EMA 权重（用于推理）
-        weights = self.ema_state if self.ema_state is not None else self.corrector.state_dict()
-        ema_path = ckpt_dir / f"corrector_step{step}.pth"
+        weights = self.ema_state if self.ema_state is not None else self.embedder.state_dict()
+        ema_path = ckpt_dir / f"embedder_step{step}.pth"
         torch.save(weights, ema_path)
 
         # 完整训练状态（用于恢复）
         state = {
             "step": step,
-            "corrector": self.corrector.state_dict(),
+            "embedder": self.embedder.state_dict(),
             "ema_state": self.ema_state,
             "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict() if self.scaler else None,
@@ -351,7 +351,7 @@ class SignalCorrectorTrainer:
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        self.corrector.load_state_dict(ckpt["corrector"])
+        self.embedder.load_state_dict(ckpt["embedder"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         if self.scaler and ckpt.get("scaler"):
             self.scaler.load_state_dict(ckpt["scaler"])
@@ -367,7 +367,7 @@ class SignalCorrectorTrainer:
     def train(self):
         tcfg = self.cfg["training"]
         total_iters = tcfg["iterations"]
-        self.corrector.train()
+        self.embedder.train()
 
         data_iter = iter(self.dataloader)
         t0 = time.time()
@@ -409,12 +409,12 @@ class SignalCorrectorTrainer:
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Signal Corrector Δ_φ")
-    parser.add_argument("--config", type=str, default="configs/train_signal_corrector.yaml")
+    parser = argparse.ArgumentParser(description="Train Flow Embedder Δ_φ")
+    parser.add_argument("--config", type=str, default="configs/train_flow_embedder.yaml")
     parser.add_argument("--resume", type=str, default=None, help="Path to training state checkpoint")
     args = parser.parse_args()
 
-    trainer = SignalCorrectorTrainer(args.config)
+    trainer = FlowEmbedderTrainer(args.config)
     if args.resume:
         trainer.load_checkpoint(args.resume)
     trainer.train()

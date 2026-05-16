@@ -3,6 +3,14 @@ Training Data Loader
 Used to load image datasets and apply RealESRGAN degradation pipeline to generate training data pairs
 """
 
+import os
+import sys
+
+# 确保项目根目录在 sys.path 中，使 datapipe 包可被导入
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import glob
 import random
 import numpy as np
@@ -167,8 +175,8 @@ class RealESRGANTrainDataset(Dataset):
                 
                 result = self.degrader.degrade(img_gt_batch)
                 
-                img_lq = result['lq'].squeeze(0)
-                img_gt_out = result['gt'].squeeze(0)
+                img_lq = result['lq'].squeeze(0).detach()
+                img_gt_out = result['gt'].squeeze(0).detach()
                 
                 return {
                     'lq': img_lq,
@@ -235,7 +243,7 @@ def test_dataloader():
     import matplotlib.pyplot as plt
     
     # Configuration paths
-    data_dir = Path(__file__).parent.parent / 'traindata'
+    data_dir = Path(__file__).parent.parent / 'testdata'
     config_path = Path(__file__).parent.parent / 'configs' / 'realesrgan_degradation.yaml'
     
     print(f"Data directory: {data_dir}")

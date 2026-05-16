@@ -1,6 +1,7 @@
 """
-Signal Corrector Δ_φ — 基于 Flux SingleStreamBlock 的轻量 DiT
+Flow Embedder Δ_φ — 基于 Flux SingleStreamBlock 的轻量 DiT
 
+将 LR latent 嵌入到预训练 T2I 的噪声→HR 整流流中。
 输入 z_LR (latent) + timestep t，输出残差 Δ，使得 z_LR + Δ ≈ z_HR。
 复用 Flux 的 RoPE、timestep embedding、SingleStreamBlock、LastLayer。
 """
@@ -28,14 +29,14 @@ from flux.modules.layers import (
 )
 
 
-class SignalCorrector(nn.Module):
+class FlowEmbedder(nn.Module):
     """
-    轻量 DiT 信号修正器，架构与 Flux SingleStream 部分同构。
+    轻量 DiT，将 LR latent 嵌入到预训练 T2I 的整流流中。
 
     前向流程:
-        z_LR [B,16,64,64] → pack [B,1024,64]
+        z_LR [B,16,H,W] → pack [B,seq,64]
           → img_in → SingleStreamBlock × depth → LastLayer
-        → unpack [B,16,64,64] = Δ
+        → unpack [B,16,H,W] = Δ
     """
 
     def __init__(
@@ -142,7 +143,7 @@ class SignalCorrector(nn.Module):
             timesteps: [B]            float in [0, 1]
 
         Returns:
-            delta:     [B, 16, H, W]  残差修正量
+            delta:     [B, 16, H, W]  嵌入残差
         """
         b, c, h, w = z_lr.shape
         h_half, w_half = h // 2, w // 2   # pack 后的 grid 尺寸
@@ -176,16 +177,16 @@ class SignalCorrector(nn.Module):
         return delta
 
 
-def create_signal_corrector(config_path: str) -> SignalCorrector:
-    """从 yaml 配置文件创建 SignalCorrector 实例。"""
+def create_flow_embedder(config_path: str) -> FlowEmbedder:
+    """从 yaml 配置文件创建 FlowEmbedder 实例。"""
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    return SignalCorrector(**cfg)
+    return FlowEmbedder(**cfg)
 
 
 if __name__ == "__main__":
-    config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "signal_corrector.yaml")
-    model = create_signal_corrector(config_path)
+    config_path = os.path.join(os.path.dirname(__file__), "..", "configs", "flow_embedder.yaml")
+    model = create_flow_embedder(config_path)
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Config:    {config_path}")

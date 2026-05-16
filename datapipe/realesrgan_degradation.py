@@ -5,12 +5,22 @@ RealESRGAN Image Degradation Pipeline
 
 import math
 import random
+import sys
+from types import ModuleType
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as tv_F
 import yaml
 from typing import Dict, Optional, Tuple
+
+# ---- compatibility: basicsr 依赖 torchvision.transforms.functional_tensor ----
+# torchvision >= 0.15 已移除该模块，需要创建兼容 shim
+if 'torchvision.transforms.functional_tensor' not in sys.modules:
+    _ft = ModuleType('torchvision.transforms.functional_tensor')
+    _ft.rgb_to_grayscale = tv_F.rgb_to_grayscale
+    sys.modules['torchvision.transforms.functional_tensor'] = _ft
 
 from basicsr.utils import DiffJPEG
 from basicsr.utils.img_process_util import filter2D
