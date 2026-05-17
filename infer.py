@@ -20,8 +20,10 @@ from PIL import Image
 
 from einops import rearrange, repeat
 
+from safetensors.torch import load_file as safe_load
 from flux.util import load_flow_model, load_t5, load_clip, load_ae
 from flux.sampling import denoise, get_schedule, get_noise, unpack
+from models.flow_embedder import create_flow_embedder
 from utils.image_spliter import ImageSpliterTh
 
 
@@ -58,6 +60,7 @@ OUTDIR = _CFG.get("out_dir", "outputs")
 VERBOSE = _CFG.get("verbose", False)
 SCALE = _CFG.get("scale", 1.0)
 START_TIMESTEP = _CFG.get("start_timestep", 1.0)
+SHIFT = _CFG.get("shift", True)
 TEXT_ENCODER_DEVICE = _CFG.get("text_encoder_device", "cuda")
 DENOISE_DEVICE = _CFG.get("denoise_device", "cuda")
 
@@ -67,6 +70,9 @@ CHOPPING_PCH_SIZE = _CHOPPING_CFG.get("pch_size", 1024)
 CHOPPING_STRIDE_RATIO = _CHOPPING_CFG.get("stride_ratio", 0.5)
 CHOPPING_EXTRA_BS = _CHOPPING_CFG.get("extra_bs", 1)
 CHOPPING_WEIGHT_TYPE = _CHOPPING_CFG.get("weight_type", "Gaussian")
+
+# Flow Embedder 路径
+FLOW_EMBEDDER_PATH = _CFG.get("flow_embedder_path", None)
 
 # 最大 T5 序列长度（dev 推荐 512，schnell 推荐 256）
 T5_MAX_LENGTH = _CFG.get("t5_max_length", 512)
@@ -103,6 +109,19 @@ class FluxInferencer:
         self.ae.eval()
 
         print("✅ Models loaded.")
+
+    def load_flow_embedder(self, ckpt_path: str, config_path: str = None):
+        """加载训练好的 Flow Embedder Δ_φ 修正模块。"""
+        if config_path is None:
+            config_path = os.path.join(_SCRIPT_DIR, "configs", "flow_embedder.yaml")
+        print(f"Loading FlowEmbedder from {ckpt_path} ...")
+        self.flow_embedder = create_flow_embedder(config_path)
+        sd = safe_load(ckpt_path)
+        self.flow_embedder.load_state_dict(sd, strict=True)
+        self.flow_embedder = self.flow_embedder.to(self.denoise_device, dtype=torch.bfloat16)
+        self.flow_embedder.eval()
+        print(f"  FlowEmbedder params: {sum(p.numel() for p in self.flow_embedder.parameters())/1e6:.2f}M")
+        print("✅ FlowEmbedder loaded.")
 
     def load_text_encoders(self, device="cuda", t5_max_length=T5_MAX_LENGTH,
                            t5xxl_path=None, clip_path=None):
@@ -194,7 +213,7 @@ class FluxInferencer:
         return image
 
     def process_patch(self, image_patch, seed, prompt, neg_prompt,
-                      steps, cfg_scale, start_timestep=1.0):
+                      steps, cfg_scale, start_timestep=1.0, shift=True):
         """处理单个 patch：VAE encode → pack → 准备条件 → 去噪 → unpack → decode。
 
         Args:
@@ -205,6 +224,7 @@ class FluxInferencer:
             steps: 采样步数
             cfg_scale: CFG 权重
             start_timestep: 起始时间步
+            shift: 是否启用时间步 shift（高噪声区分配更多步数）
 
         Returns:
             [B,3,H,W] 像素 tensor [0,1]
@@ -217,6 +237,14 @@ class FluxInferencer:
         image_tensor = image_patch * 2.0 - 1.0
         latent = self.vae_encode_tensor(image_tensor)  # [B,16,H//8,W//8]
         b, c, h_lat, w_lat = latent.shape
+
+        # 1.5) Flow Embedder 修正（若有）
+        if hasattr(self, 'flow_embedder'):
+            t_start = torch.full((b,), start_timestep, device=self.denoise_device, dtype=torch.bfloat16)
+            with torch.no_grad():
+                delta = self.flow_embedder(latent.to(torch.bfloat16), t_start)
+            latent = latent + delta.to(latent.dtype)
+            self.print(f"   FlowEmbedder applied, t={start_timestep}")
 
         # 2) 生成噪声（spatial 格式，与 latent 同尺寸）
         noise = get_noise(batch_size, h_pix, w_pix, device,
@@ -255,7 +283,7 @@ class FluxInferencer:
 
         # 4) 获取时间步调度（从 start_timestep 到 0，固定 steps 步）
         seq_len = packed_latent.shape[1]
-        timesteps = get_schedule(steps, seq_len, start_timestep=start_timestep, shift=True)
+        timesteps = get_schedule(steps, seq_len, start_timestep=start_timestep, shift=shift)
 
         # 5) 去噪（内部处理 img2img 混合）
         packed_result = self.do_sampling(
@@ -275,7 +303,7 @@ class FluxInferencer:
     def gen_image(self, prompt="", neg_prompt="", steps=STEPS,
                   cfg_scale=CFG_SCALE, seed=SEED,
                   out_dir=OUTDIR,
-                  init_image=None, scale=1.0, start_timestep=1.0,
+                  init_image=None, scale=1.0, start_timestep=1.0, shift=True,
                   chopping_enabled=False, chopping_pch_size=512,
                   chopping_stride_ratio=0.5, chopping_extra_bs=1,
                   chopping_weight_type='Gaussian'):
@@ -290,7 +318,7 @@ class FluxInferencer:
 
         image = self._gen_img2img(
             init_image, scale, seed, prompt, neg_prompt,
-            steps, cfg_scale, start_timestep,
+            steps, cfg_scale, start_timestep, shift,
             chopping_enabled, chopping_pch_size,
             chopping_stride_ratio, chopping_extra_bs,
             chopping_weight_type,
@@ -303,7 +331,7 @@ class FluxInferencer:
         self.print("Done")
 
     def _gen_img2img(self, init_image, scale, seed, prompt, neg_prompt,
-                     steps, cfg_scale, start_timestep,
+                     steps, cfg_scale, start_timestep, shift,
                      chopping_enabled, chopping_pch_size,
                      chopping_stride_ratio, chopping_extra_bs,
                      chopping_weight_type) -> Image.Image:
@@ -351,7 +379,7 @@ class FluxInferencer:
             print(f"📐 img2img 整张推理: {ori_w}x{ori_h}")
             res_sr = self.process_patch(
                 im_cond, seed, prompt, neg_prompt,
-                steps, cfg_scale, start_timestep,
+                steps, cfg_scale, start_timestep, shift,
             )
         else:
             # 路径 B：分块推理（ImageSpliterTh）
@@ -377,7 +405,7 @@ class FluxInferencer:
 
                 res_pch = self.process_patch(
                     im_pch, seed, prompt, neg_prompt,
-                    steps, cfg_scale, start_timestep,
+                    steps, cfg_scale, start_timestep, shift,
                 )
 
                 im_spliter.update(res_pch, index_infos)
@@ -419,6 +447,7 @@ def main(
     init_image=None,
     scale=SCALE,
     start_timestep=START_TIMESTEP,
+    shift=SHIFT,
     t5_max_length=T5_MAX_LENGTH,
     # ---- Chopping 参数 ----
     chopping_enabled=CHOPPING_ENABLED,
@@ -447,6 +476,7 @@ def main(
         init_image = init_image if init_image is not None else custom_cfg.get("init_image", init_image)
         scale = scale if scale != 1.0 else custom_cfg.get("scale", scale)
         start_timestep = start_timestep if start_timestep != 1.0 else custom_cfg.get("start_timestep", start_timestep)
+        shift = shift if shift != SHIFT else custom_cfg.get("shift", shift)
         t5_max_length = t5_max_length if t5_max_length != 512 else custom_cfg.get("t5_max_length", t5_max_length)
         custom_chopping = custom_cfg.get("chopping", {})
         if chopping_enabled == CHOPPING_ENABLED:
@@ -466,12 +496,19 @@ def main(
     # Phase 2: 加载 Flux + VAE（此时 T5/CLIP 已释放，显存只供 Flux ~12GB）
     inferencer.load(model_name, verbose, denoise_device)
 
+    # Phase 2.5: 加载 Flow Embedder（若有）
+    fe_path = FLOW_EMBEDDER_PATH
+    if config is not None:
+        fe_path = custom_cfg.get("flow_embedder_path", fe_path)
+    if fe_path:
+        inferencer.load_flow_embedder(fe_path)
+
     # Phase 3: 推理
     os.makedirs(out_dir, exist_ok=True)
 
     inferencer.gen_image(
         prompt, "", _steps, _cfg, seed, out_dir,
-        init_image=init_image, scale=scale, start_timestep=start_timestep,
+        init_image=init_image, scale=scale, start_timestep=start_timestep, shift=shift,
         chopping_enabled=chopping_enabled,
         chopping_pch_size=chopping_pch_size,
         chopping_stride_ratio=chopping_stride_ratio,

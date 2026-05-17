@@ -9,8 +9,9 @@ Loss = MSE( v_θ(x_t, t) , ε - z_HR )
   python train_flow_embedder.py --config configs/train_flow_embedder.yaml
 """
 
-import argparse
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+import argparse
 import random
 import time
 from collections import OrderedDict
@@ -23,6 +24,7 @@ import torch.nn.functional as F
 import yaml
 from einops import rearrange, repeat
 from torch.amp import GradScaler, autocast
+from safetensors.torch import save_file as safe_save
 from tqdm import tqdm
 
 from datapipe.train_dataloader import create_train_dataloader
@@ -365,12 +367,12 @@ class FlowEmbedderTrainer:
     def save_checkpoint(self, step: int):
         ckpt_dir = self.exp_dir / "checkpoints"
 
-        # EMA 权重（用于推理）
+        # 推理权重（safetensors，仅含 tensor）
         weights = self.ema_state if self.ema_state is not None else self.embedder.state_dict()
-        ema_path = ckpt_dir / f"embedder_step{step}.pth"
-        torch.save(weights, ema_path)
+        ema_path = ckpt_dir / f"flow_embedder_step{step}.safetensors"
+        safe_save(weights, ema_path)
 
-        # 完整训练状态（用于恢复）
+        # 完整训练状态（含 optimizer/scaler，仍需 torch.save）
         state = {
             "step": step,
             "embedder": self.embedder.state_dict(),
@@ -409,7 +411,7 @@ class FlowEmbedderTrainer:
             initial=self.global_step,
             desc="Train",
             unit="step",
-            bar_format="{desc} [{n:>6d}/{total_fmt}] {percentage:3.0f}% |{bar}| loss={postfix} [{rate:>4.0f}it/s]",
+            bar_format="{desc} [{n:>6d}/{total_fmt}] {percentage:3.0f}% |{bar}| {postfix} [{rate_fmt}]",
         )
 
         # 累计损失，每 log_freq 步输出一次平均值
@@ -431,7 +433,7 @@ class FlowEmbedderTrainer:
                 loss_cnt += 1
 
                 # 进度条显示当前步 loss
-                pbar.set_postfix_str(f"{loss_dict['loss']:.6f}")
+                pbar.set_postfix(loss=f"{loss_dict['loss']:.6f}")
                 pbar.update(1)
 
                 # 每 log_freq 步输出平均损失

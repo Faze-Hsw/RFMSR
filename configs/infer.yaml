@@ -18,6 +18,7 @@ steps: 28          # 采样步数 (dev 推荐 28~50, schnell 固定 4)
 seed: 42
 scale: 1.0          # 放大倍数，输出尺寸 = 原图 × scale
 start_timestep: 1.0 # 起始时间步 (0~1)，1.0=完全重绘，0.5=保留一半原图结构
+shift: true          # 时间步调度是否使用 shift（高噪声区分配更多步数）
 
 # T5 最大序列长度 (dev 推荐 512, schnell 推荐 256)
 t5_max_length: 512
@@ -39,3 +40,6 @@ chopping:
   stride_ratio: 0.5  # 滑窗步长比例，stride = pch_size × ratio
   extra_bs: 1        # 每次迭代并行处理的 patch 数量
   weight_type: Gaussian  # 融合权重: Gaussian / ones
+
+# Flow Embedder 嵌入修正（可训练微调模块）
+flow_embedder_path: checkpoints/flow_embedder.safetensors
