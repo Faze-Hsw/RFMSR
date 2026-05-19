@@ -440,8 +440,8 @@ class FlowEmbedderTrainer:
                 if self.global_step % self.log_freq == 0:
                     avg_loss = loss_ema / loss_cnt
                     lr = self.optimizer.param_groups[0]['lr']
-                    tqdm.write(
-                        f"[step {self.global_step}/{total_iters}] "
+                    print(
+                        f"\n[step {self.global_step}/{total_iters}] "
                         f"avg_loss={avg_loss:.6f}  lr={lr:.2e}"
                     )
                     loss_ema = 0.0

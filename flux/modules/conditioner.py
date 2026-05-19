@@ -14,13 +14,16 @@ from safetensors.torch import load_file as load_sft
 
 
 def _from_pretrained_local_first(cls, *args, **kwargs):
-    """优先从本地 HF cache 加载，缓存没有再联网下载。"""
-    try:
-        return cls.from_pretrained(*args, **kwargs, local_files_only=True)
-    except Exception:
-        # 本地加载失败 → 联网下载
-        pass
-    return cls.from_pretrained(*args, **kwargs)
+    """同官方 from_pretrained，但跳过模型权重下载（只下小文件）。"""
+    version = args[0] if args else kwargs.get("pretrained_model_name_or_path", "")
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        version,
+        allow_patterns=["tokenizer*", "config*", "spiece*", "special_tokens*",
+                        "vocab*", "merges*", "added_tokens*", "*.json"],
+        ignore_patterns=["*.bin", "*.safetensors", "*.h5", "model*"],
+    )
+    return cls.from_pretrained(*args, **kwargs, local_files_only=True)
 
 
 class HFEmbedder(nn.Module):
