@@ -71,12 +71,13 @@ class FlowEmbedderTrainer:
         self._build_optimizer()
         self._build_dataloader()
         self._build_ema()
-        self._build_discriminator()
-        self._build_lpips()
 
         # AMP
         self.use_amp = self.cfg["training"]["use_amp"]
         self.scaler = GradScaler() if self.use_amp else None
+
+        self._build_discriminator()
+        self._build_lpips()
 
         # 训练状态
         self.global_step = 0
@@ -211,6 +212,16 @@ class FlowEmbedderTrainer:
             print(f" | {d_groups}D+{s_groups}S groups", end="")
         print()
         print(f"EMA rate   : {self.ema_rate}")
+        # 判别器 & 损失权重
+        dcfg = self.cfg.get("discriminator", {})
+        if dcfg.get("enabled", False) and self.discriminator is not None:
+            dp = sum(p.numel() for p in self.discriminator.parameters())
+            print(f"Discriminator: {dp/1e6:.2f}M params, lr={dcfg.get('lr', 5e-5)}, w_max={dcfg.get('w_max', 0.1)}")
+        else:
+            print("Discriminator: disabled")
+        print(f"Loss weights : L2=1.0, LPIPS={self.lpips_weight}, GAN(w_max)={dcfg.get('w_max', 0)} * t")
+        if dcfg.get("enabled"):
+            print(f"  GAN warmup : {dcfg.get('dis_init_iterations', 0)} steps (generator L2+LPIPS only)")
         print("=" * 60 + "\n")
 
     # ------------------------------------------------------------------
