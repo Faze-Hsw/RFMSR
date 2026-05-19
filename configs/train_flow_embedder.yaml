@@ -8,7 +8,7 @@ data:
   hr_dir: traindata/
   degradation_config: configs/realesrgan_degradation.yaml
   gt_size: 512
-  batch_size: 8
+  batch_size: 12
   num_workers: 12
   use_hflip: true
   use_rot: false
@@ -27,7 +27,7 @@ flux:
 
 # ---- 训练 ----
 training:
-  iterations: 500000
+  iterations: 100000
   lr: 5.0e-5
   weight_decay: 0
   gradient_clip: 1.0
@@ -40,6 +40,27 @@ training:
   seed: 42
   use_gradient_checkpointing: true     
   gradient_checkpointing_chunk: 3      
+
+# ---- 判别器（GAN）----
+discriminator:
+  enabled: true               # false=关闭 GAN，只用 L2 重构
+  dis_init_iterations: 1000  # 前 N 步只训生成器
+  w_max: 0.1                  # GAN 最大权重 (实际 = w_max * t)
+  lr: 5.0e-5
+  weight_decay: 1.0e-3
+  params:
+    in_channels: 16
+    block_out_channels: [128, 256, 512]
+    layers_per_block: [1, 2, 2]
+    cross_attention_dim: 4096
+    time_emb_dim: 256
+    attention_head_dim: [8, 16, 16]
+    vec_dim: 768
+
+# ---- LPIPS 感知损失（像素空间）----
+lpips:
+  weight: 2.0        # 0=关闭
+  net: vgg           # alex 或 vgg
 
 # ---- 日志 & 保存 ----
 experiment:

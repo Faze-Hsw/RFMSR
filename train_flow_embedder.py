@@ -1,9 +1,9 @@
 """
 Flow Embedder Δ_φ 训练脚本
 
-训练目标: 让冻结 Flux 在 FlowEmbedder 修正后的嵌入点上预测出正确的 velocity
-Loss = MSE( v_θ(x_t, t) , ε - z_HR )
-其中 x_t = (1-t) * (z_LR + Δ_φ(z_LR, t)) + t * ε
+训练目标: 一步 Euler 重构损失 + 可选 GAN 对抗损失
+Loss = MSE(z_pred, z_HR) + w_max * t * GAN_loss(z_pred, z_HR)
+其中 z_pred = x_t - t * v_θ(x_t, t), x_t = (1-t) * (z_LR + Δ_φ(z_LR, t)) + t * ε
 
 用法:
   python train_flow_embedder.py --config configs/train_flow_embedder.yaml
@@ -30,6 +30,13 @@ from tqdm import tqdm
 from datapipe.train_dataloader import create_train_dataloader
 from flux.util import load_flow_model, load_t5, load_clip, load_ae
 from models.flow_embedder import FlowEmbedder, create_flow_embedder
+from models.latent_discriminator import LatentDiscriminator, hinge_d_loss, gen_loss
+
+try:
+    import lpips
+    _LPIPS_AVAILABLE = True
+except ImportError:
+    _LPIPS_AVAILABLE = False
 
 
 # =========================================================================
@@ -64,6 +71,8 @@ class FlowEmbedderTrainer:
         self._build_optimizer()
         self._build_dataloader()
         self._build_ema()
+        self._build_discriminator()
+        self._build_lpips()
 
         # AMP
         self.use_amp = self.cfg["training"]["use_amp"]
@@ -273,6 +282,7 @@ class FlowEmbedderTrainer:
 
     def train_step(self, batch: dict) -> dict:
         tcfg = self.cfg["training"]
+        dcfg = self.cfg.get("discriminator", {})
         device = self.device
 
         hr = batch["gt"].to(device)      # [B,3,512,512] [0,1]
@@ -284,45 +294,79 @@ class FlowEmbedderTrainer:
         lr_up = F.interpolate(lr, size=hr.shape[-2:], mode="bicubic", align_corners=False)
         z_lr = self.vae_encode(lr_up)    # [B,16,64,64]
 
-        # detach，后面 Δ_φ 接收 z_lr 作为输入但不需要 VAE 的梯度
         z_hr = z_hr.detach().float()
         z_lr = z_lr.detach().float()
 
-        # 2. 采样时间步 t（Logit-Normal 分布，与 SD3/Flux 预训练一致）和噪声 ε
+        # 2. 时间步 t + 噪声 ε
         logit_mean = tcfg.get("logit_normal_mean", 0.0)
         logit_std = tcfg.get("logit_normal_std", 1.0)
         t = torch.sigmoid(torch.randn(bs, device=device) * logit_std + logit_mean)
         eps = torch.randn_like(z_hr)
 
-        # 3. Flow Embedder 前向（在 AMP 下，它对精度敏感）
+        # ══════════════════════════════════════════
+        # Generator 前向
+        # ══════════════════════════════════════════
         with autocast(device_type="cuda", enabled=self.use_amp):
             delta = self.embedder(z_lr, t)               # [B,16,64,64]
             z_corrected = z_lr + delta
-
-            # 4. 构造嵌入点 x_t
-            t_expand = t[:, None, None, None]              # [B,1,1,1]
+            t_expand = t[:, None, None, None]
             x_t = (1.0 - t_expand) * z_corrected + t_expand * eps
 
-        # 5. Flux 前向（Flux 权重已冻结 + bf16，AMP 无帮助反而可能引起精度问题）
         x_t_packed = self.pack(x_t.to(torch.bfloat16))
         _, _, h_lat, w_lat = z_hr.shape
-        img_ids = self.make_img_ids(bs, h_lat // 2, w_lat // 2, device)
-
+        h_pack, w_pack = h_lat // 2, w_lat // 2
+        img_ids = self.make_img_ids(bs, h_pack, w_pack, device)
         v_pred = self.flux_velocity(x_t_packed, t, img_ids, bs)
 
-        # 6. 目标 velocity
-        v_target = eps - z_hr                          # [B,16,64,64]
-        v_target_packed = self.pack(v_target.to(torch.bfloat16))
+        # 3. 一步 Euler 重构 z_pred = x_t - t * v_pred
+        z_pred_packed = x_t_packed - t[:, None, None].to(torch.bfloat16) * v_pred
 
-        # 7. Loss（NaN 诊断）
-        loss = F.mse_loss(v_pred.float(), v_target_packed.float())
-        if torch.isnan(loss):
-            for name, t in [("delta", delta), ("x_t", x_t), ("v_pred", v_pred), ("v_target", v_target)]:
-                has_nan = torch.isnan(t).any().item()
-                has_inf = torch.isinf(t).any().item()
-                print(f"  ⚠️  {name}: nan={has_nan} inf={has_inf}  min={t.min().item():.3f} max={t.max().item():.3f}")
+        # 4. Unpack → VAE decode 到像素空间
+        z_pred_spatial = rearrange(
+            z_pred_packed, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+            h=h_pack, w=w_pack, ph=2, pw=2,
+        )
+        # VAE decode 输出 [-1, 1]
+        sr_img = self.ae.decode(z_pred_spatial.to(torch.bfloat16))
+        hr_img = self.ae.decode(z_hr.to(torch.bfloat16))
 
-        # 8. Backward
+        # 像素空间 L2
+        loss_l2 = F.mse_loss(sr_img.float(), hr_img.float())
+        losses = {"l2": loss_l2.item()}
+
+        # LPIPS（可选）
+        if self.lpips_weight > 0 and self.lpips_loss is not None:
+            # LPIPS 需要 [0, 1] 输入
+            sr_norm = (sr_img.float() + 1.0) / 2.0
+            hr_norm = (hr_img.float() + 1.0) / 2.0
+            loss_lpips = self.lpips_loss(sr_norm, hr_norm).mean()
+        else:
+            loss_lpips = torch.zeros(1, device=device)
+
+        # 5. GAN 生成器损失（若有判别器且过预热期）
+        loss_gan = torch.zeros(1, device=device)
+        dis_enabled = (
+            self.discriminator is not None
+            and self.global_step >= dcfg.get("dis_init_iterations", 0)
+        )
+        if dis_enabled:
+            txt_batch = self.cached_txt.expand(bs, -1, -1).to(device, dtype=torch.bfloat16)
+            vec_batch = self.cached_vec.expand(bs, -1).to(device, dtype=torch.bfloat16)
+            logits_fake = self.discriminator(
+                z_pred_spatial.to(torch.float32),
+                t, txt_batch, vec_batch,
+            )
+            loss_gan = gen_loss(logits_fake)
+            w_max = dcfg.get("w_max", 0.1)
+            gan_weight = w_max * t.mean()
+            loss_gan = loss_gan * gan_weight
+            losses["gan"] = loss_gan.item()
+
+        loss = loss_l2 + self.lpips_weight * loss_lpips + loss_gan
+        if self.lpips_weight > 0:
+            losses["lpips"] = loss_lpips.item()
+
+        # 5. Generator 反向传播
         self.optimizer.zero_grad()
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
@@ -341,10 +385,33 @@ class FlowEmbedderTrainer:
                 )
             self.optimizer.step()
 
-        # 9. EMA
+        # 6. Discriminator 训练（每步都训）
+        if dis_enabled:
+            with torch.no_grad():
+                txt_batch_d = self.cached_txt.expand(bs, -1, -1).to(device, dtype=torch.bfloat16)
+                vec_batch_d = self.cached_vec.expand(bs, -1).to(device, dtype=torch.bfloat16)
+
+            z_hr_clamp = z_hr.float().clamp(-10, 10)
+            logits_real = self.discriminator(z_hr_clamp, t, txt_batch_d, vec_batch_d)
+            logits_fake = self.discriminator(
+                z_pred_spatial.float().clamp(-10, 10), t, txt_batch_d, vec_batch_d,
+            )
+            loss_d = hinge_d_loss(logits_real, logits_fake)
+
+            self.opt_dis.zero_grad()
+            if self.scaler_dis is not None:
+                self.scaler_dis.scale(loss_d).backward()
+                self.scaler_dis.step(self.opt_dis)
+                self.scaler_dis.update()
+            else:
+                loss_d.backward()
+                self.opt_dis.step()
+            losses["d"] = loss_d.item()
+
+        # 7. EMA
         self._update_ema()
 
-        return {"loss": loss.item()}
+        return losses
 
     # ------------------------------------------------------------------
     # EMA
@@ -359,6 +426,49 @@ class FlowEmbedderTrainer:
                 self.ema_state[k].mul_(self.ema_rate).add_(v.data, alpha=1 - self.ema_rate)
             else:
                 self.ema_state[k] = v.data.clone()
+
+    # ------------------------------------------------------------------
+    # Discriminator
+    # ------------------------------------------------------------------
+
+    def _build_discriminator(self):
+        dcfg = self.cfg.get("discriminator", {})
+        if not dcfg.get("enabled", False):
+            self.discriminator = None
+            return
+        params = dcfg.get("params", {})
+        self.discriminator = LatentDiscriminator(**params).to(self.device)
+        self.discriminator.train()
+        self.opt_dis = torch.optim.AdamW(
+            self.discriminator.parameters(),
+            lr=dcfg.get("lr", 5e-5),
+            weight_decay=dcfg.get("weight_decay", 1e-3),
+        )
+        self.scaler_dis = GradScaler() if self.use_amp else None
+        dp = sum(p.numel() for p in self.discriminator.parameters())
+        print(f"✅ Discriminator: {dp/1e6:.2f}M params")
+
+    # ------------------------------------------------------------------
+    # LPIPS
+    # ------------------------------------------------------------------
+
+    def _build_lpips(self):
+        lcfg = self.cfg.get("lpips", {})
+        weight = lcfg.get("weight", 0.0)
+        self.lpips_weight = weight
+        self.lpips_loss = None
+        if weight <= 0:
+            return
+        if not _LPIPS_AVAILABLE:
+            print("  ⚠️  lpips 未安装，跳过 (pip install lpips)")
+            self.lpips_weight = 0.0
+            return
+        self.lpips_loss = lpips.LPIPS(net=lcfg.get("net", "vgg"))
+        self.lpips_loss.to(self.device)
+        self.lpips_loss.eval()
+        for p in self.lpips_loss.parameters():
+            p.requires_grad_(False)
+        print(f"✅ LPIPS ({lcfg.get('net', 'vgg')}) loaded, weight={weight}")
 
     # ------------------------------------------------------------------
     # Checkpoint
@@ -380,6 +490,11 @@ class FlowEmbedderTrainer:
             "optimizer": self.optimizer.state_dict(),
             "scaler": self.scaler.state_dict() if self.scaler else None,
         }
+        if self.discriminator is not None:
+            state["discriminator"] = self.discriminator.state_dict()
+            state["opt_dis"] = self.opt_dis.state_dict()
+            if self.scaler_dis is not None:
+                state["scaler_dis"] = self.scaler_dis.state_dict()
         state_path = ckpt_dir / f"training_state_step{step}.pth"
         torch.save(state, state_path)
         print(f"💾 Checkpoint saved: step {step}")
@@ -392,6 +507,11 @@ class FlowEmbedderTrainer:
             self.scaler.load_state_dict(ckpt["scaler"])
         if ckpt.get("ema_state"):
             self.ema_state = ckpt["ema_state"]
+        if self.discriminator is not None and ckpt.get("discriminator"):
+            self.discriminator.load_state_dict(ckpt["discriminator"])
+            self.opt_dis.load_state_dict(ckpt["opt_dis"])
+            if self.scaler_dis is not None and ckpt.get("scaler_dis"):
+                self.scaler_dis.load_state_dict(ckpt["scaler_dis"])
         self.global_step = ckpt["step"]
         print(f"✅ Resumed from step {self.global_step}")
 
@@ -429,20 +549,27 @@ class FlowEmbedderTrainer:
                 loss_dict = self.train_step(batch)
                 self.global_step += 1
 
-                loss_ema += loss_dict["loss"]
+                loss_ema += loss_dict.get("l2", 0)
                 loss_cnt += 1
 
                 # 进度条显示当前步 loss
-                pbar.set_postfix(loss=f"{loss_dict['loss']:.6f}")
+                postfix = {"l2": f"{loss_dict.get('l2', 0):.4f}"}
+                if "gan" in loss_dict:
+                    postfix["gan"] = f"{loss_dict['gan']:.4f}"
+                if "d" in loss_dict:
+                    postfix["d"] = f"{loss_dict['d']:.4f}"
+                if "lpips" in loss_dict:
+                    postfix["lpips"] = f"{loss_dict['lpips']:.4f}"
+                pbar.set_postfix(**postfix)
                 pbar.update(1)
 
                 # 每 log_freq 步输出平均损失
                 if self.global_step % self.log_freq == 0:
-                    avg_loss = loss_ema / loss_cnt
+                    avg_loss = loss_ema / max(loss_cnt, 1)
                     lr = self.optimizer.param_groups[0]['lr']
                     print(
                         f"\n[step {self.global_step}/{total_iters}] "
-                        f"avg_loss={avg_loss:.6f}  lr={lr:.2e}"
+                        f"l2={avg_loss:.6f}  lr={lr:.2e}"
                     )
                     loss_ema = 0.0
                     loss_cnt = 0
