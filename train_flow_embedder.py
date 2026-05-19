@@ -460,9 +460,10 @@ class FlowEmbedderTrainer:
         if weight <= 0:
             return
         if not _LPIPS_AVAILABLE:
-            print("  ⚠️  lpips 未安装，跳过 (pip install lpips)")
-            self.lpips_weight = 0.0
-            return
+            raise ImportError(
+                "LPIPS weight > 0 but lpips is not installed. "
+                "Run: pip install lpips"
+            )
         self.lpips_loss = lpips.LPIPS(net=lcfg.get("net", "vgg"))
         self.lpips_loss.to(self.device)
         self.lpips_loss.eval()
