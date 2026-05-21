@@ -43,3 +43,4 @@ chopping:
 
 # Flow Embedder 嵌入修正（可训练微调模块）
 flow_embedder_path: checkpoints/flow_embedder.safetensors
+no_flow_embedder: false    # true=禁用 Flow Embedder，仅用纯 Flux img2img

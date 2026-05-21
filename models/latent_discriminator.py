@@ -377,12 +377,17 @@ class LatentDiscriminator(nn.Module):
         Returns:
             list of [B, 1, h, w] logit maps at different scales
         """
-        # 0) 文本压缩
-        context = encoder_hidden_states
+        # 0) 统一 cast 输入到 float（模型是 float32）
+        sample = sample.float()
+        timestep = timestep.float()
+        context = encoder_hidden_states.float() if encoder_hidden_states is not None else None
+        vec = vec.float() if vec is not None else None
+
+        # 1) 文本压缩
         if context is not None and self.hidden_compress is not None:
             context = self.hidden_compress(context)
 
-        # 1) 时间嵌入 + CLIP vec 注入
+        # 2) 时间嵌入 + CLIP vec 注入
         time_emb = self.time_embed(timestep)  # [B, time_emb_dim]
         if vec is not None and self.vec_proj is not None:
             time_emb = time_emb + self.vec_proj(vec)

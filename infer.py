@@ -455,6 +455,7 @@ def main(
     chopping_stride_ratio=CHOPPING_STRIDE_RATIO,
     chopping_extra_bs=CHOPPING_EXTRA_BS,
     chopping_weight_type=CHOPPING_WEIGHT_TYPE,
+    no_flow_embedder=False,
 ):
     """Flux img2img 超分推理入口。
 
@@ -500,8 +501,12 @@ def main(
     fe_path = FLOW_EMBEDDER_PATH
     if config is not None:
         fe_path = custom_cfg.get("flow_embedder_path", fe_path)
-    if fe_path:
+        if custom_cfg.get("no_flow_embedder", False):
+            no_flow_embedder = True
+    if fe_path and not no_flow_embedder:
         inferencer.load_flow_embedder(fe_path)
+    elif no_flow_embedder:
+        print("⏭️  Flow Embedder disabled.")
 
     # Phase 3: 推理
     os.makedirs(out_dir, exist_ok=True)

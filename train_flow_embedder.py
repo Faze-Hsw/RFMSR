@@ -337,9 +337,13 @@ class FlowEmbedderTrainer:
             z_pred_packed, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
             h=h_pack, w=w_pack, ph=2, pw=2,
         )
-        # VAE decode 输出 [-1, 1]
-        sr_img = self.ae.decode(z_pred_spatial.to(torch.bfloat16))
-        hr_img = self.ae.decode(z_hr.to(torch.bfloat16))
+        # VAE decode（sr_img 用梯度检查点省显存，hr_img 无需梯度）
+        sr_img = torch.utils.checkpoint.checkpoint(
+            lambda z: self.ae.decode(z), z_pred_spatial.to(torch.bfloat16),
+            use_reentrant=False,
+        )
+        with torch.no_grad():
+            hr_img = self.ae.decode(z_hr.to(torch.bfloat16))
 
         # 像素空间 L2
         loss_l2 = F.mse_loss(sr_img.float(), hr_img.float())
@@ -405,7 +409,7 @@ class FlowEmbedderTrainer:
             z_hr_clamp = z_hr.float().clamp(-10, 10)
             logits_real = self.discriminator(z_hr_clamp, t, txt_batch_d, vec_batch_d)
             logits_fake = self.discriminator(
-                z_pred_spatial.float().clamp(-10, 10), t, txt_batch_d, vec_batch_d,
+                z_pred_spatial.detach().float().clamp(-10, 10), t, txt_batch_d, vec_batch_d,
             )
             loss_d = hinge_d_loss(logits_real, logits_fake)
 
