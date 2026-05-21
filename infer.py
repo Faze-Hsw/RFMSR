@@ -71,8 +71,9 @@ CHOPPING_STRIDE_RATIO = _CHOPPING_CFG.get("stride_ratio", 0.5)
 CHOPPING_EXTRA_BS = _CHOPPING_CFG.get("extra_bs", 1)
 CHOPPING_WEIGHT_TYPE = _CHOPPING_CFG.get("weight_type", "Gaussian")
 
-# Flow Embedder 路径
+# Flow Embedder 路径 & 开关
 FLOW_EMBEDDER_PATH = _CFG.get("flow_embedder_path", None)
+NO_FLOW_EMBEDDER = _CFG.get("no_flow_embedder", False)
 
 # 最大 T5 序列长度（dev 推荐 512，schnell 推荐 256）
 T5_MAX_LENGTH = _CFG.get("t5_max_length", 512)
@@ -284,6 +285,8 @@ class FluxInferencer:
         # 4) 获取时间步调度（从 start_timestep 到 0，固定 steps 步）
         seq_len = packed_latent.shape[1]
         timesteps = get_schedule(steps, seq_len, start_timestep=start_timestep, shift=shift)
+        self.print(f"   Timestep schedule ({len(timesteps)} steps): "
+                   f"[{timesteps[0]:.4f}, {timesteps[1]:.4f}, ..., {timesteps[-2]:.4f}, {timesteps[-1]:.4f}]")
 
         # 5) 去噪（内部处理 img2img 混合）
         packed_result = self.do_sampling(
@@ -432,9 +435,9 @@ class FluxInferencer:
 #################################################################################################
 
 
+
 @torch.no_grad()
 def main(
-    config=None,
     model_name=MODEL_NAME,
     prompt=PROMPT,
     out_dir=OUTDIR,
@@ -459,30 +462,11 @@ def main(
 ):
     """Flux img2img 超分推理入口。
 
-    参数优先级: CLI 参数 > configs/infer.yaml > 内置默认值。
+    所有默认值从 configs/infer.yaml 读取，CLI 参数可覆盖。
     必须提供 --init_image 参数。
 
     Flux 使用 RoPE 位置编码，天然支持任意分辨率输入 ✅
     """
-    # 自定义配置文件覆盖
-    if config is not None:
-        custom_cfg = load_config(config)
-        model_name = model_name if model_name != MODEL_NAME else custom_cfg.get("model_name", model_name)
-        prompt = prompt if prompt != PROMPT else custom_cfg.get("prompt", prompt)
-        out_dir = out_dir if out_dir != OUTDIR else custom_cfg.get("out_dir", out_dir)
-        seed = seed if seed != SEED else custom_cfg.get("seed", seed)
-        verbose = verbose if verbose != VERBOSE else custom_cfg.get("verbose", verbose)
-        text_encoder_device = text_encoder_device if text_encoder_device != TEXT_ENCODER_DEVICE else custom_cfg.get("text_encoder_device", text_encoder_device)
-        denoise_device = denoise_device if denoise_device != DENOISE_DEVICE else custom_cfg.get("denoise_device", denoise_device)
-        init_image = init_image if init_image is not None else custom_cfg.get("init_image", init_image)
-        scale = scale if scale != 1.0 else custom_cfg.get("scale", scale)
-        start_timestep = start_timestep if start_timestep != 1.0 else custom_cfg.get("start_timestep", start_timestep)
-        shift = shift if shift != SHIFT else custom_cfg.get("shift", shift)
-        t5_max_length = t5_max_length if t5_max_length != 512 else custom_cfg.get("t5_max_length", t5_max_length)
-        custom_chopping = custom_cfg.get("chopping", {})
-        if chopping_enabled == CHOPPING_ENABLED:
-            chopping_enabled = custom_chopping.get("enabled", chopping_enabled)
-
     _steps = steps or STEPS
     _cfg = cfg or CFG_SCALE
 
@@ -499,14 +483,12 @@ def main(
 
     # Phase 2.5: 加载 Flow Embedder（若有）
     fe_path = FLOW_EMBEDDER_PATH
-    if config is not None:
-        fe_path = custom_cfg.get("flow_embedder_path", fe_path)
-        if custom_cfg.get("no_flow_embedder", False):
-            no_flow_embedder = True
-    if fe_path and not no_flow_embedder:
-        inferencer.load_flow_embedder(fe_path)
-    elif no_flow_embedder:
+    if no_flow_embedder or NO_FLOW_EMBEDDER:
         print("⏭️  Flow Embedder disabled.")
+    elif fe_path:
+        inferencer.load_flow_embedder(fe_path)
+    else:
+        print("⚠️  Flow Embedder not configured.")
 
     # Phase 3: 推理
     os.makedirs(out_dir, exist_ok=True)
