@@ -364,12 +364,7 @@ class FlowEmbedderTrainer:
             and self.global_step >= dcfg.get("dis_init_iterations", 0)
         )
         if dis_enabled:
-            txt_batch = self.cached_txt.expand(bs, -1, -1).to(device, dtype=torch.bfloat16)
-            vec_batch = self.cached_vec.expand(bs, -1).to(device, dtype=torch.bfloat16)
-            logits_fake = self.discriminator(
-                z_pred_spatial.to(torch.float32),
-                t, txt_batch, vec_batch,
-            )
+            logits_fake = self.discriminator(z_pred_spatial.to(torch.float32))
             loss_gan_raw = gen_loss(logits_fake)
             losses["gan"] = loss_gan_raw.item()
             w_max = dcfg.get("w_max", 0.1)
@@ -401,14 +396,10 @@ class FlowEmbedderTrainer:
 
         # 6. Discriminator 训练（每步都训）
         if dis_enabled:
-            with torch.no_grad():
-                txt_batch_d = self.cached_txt.expand(bs, -1, -1).to(device, dtype=torch.bfloat16)
-                vec_batch_d = self.cached_vec.expand(bs, -1).to(device, dtype=torch.bfloat16)
-
             z_hr_clamp = z_hr.float().clamp(-10, 10)
-            logits_real = self.discriminator(z_hr_clamp, t, txt_batch_d, vec_batch_d)
+            logits_real = self.discriminator(z_hr_clamp)
             logits_fake = self.discriminator(
-                z_pred_spatial.detach().float().clamp(-10, 10), t, txt_batch_d, vec_batch_d,
+                z_pred_spatial.detach().float().clamp(-10, 10),
             )
             loss_d = hinge_d_loss(logits_real, logits_fake)
 

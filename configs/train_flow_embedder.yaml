@@ -52,10 +52,6 @@ discriminator:
     in_channels: 16
     block_out_channels: [128, 256, 512]
     layers_per_block: [1, 2, 2]
-    cross_attention_dim: 4096
-    time_emb_dim: 256
-    attention_head_dim: [8, 16, 16]
-    vec_dim: 768
 
 # ---- LPIPS 感知损失（像素空间）----
 lpips:
