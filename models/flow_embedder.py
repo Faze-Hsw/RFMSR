@@ -1,9 +1,9 @@
 """
-Flow Embedder Δ_φ — 基于 Flux SingleStreamBlock 的轻量 DiT
+Flow Embedder ε_φ — 基于 Flux SingleStreamBlock 的轻量 DiT
 
-将 LR latent 嵌入到预训练 T2I 的噪声→HR 整流流中。
-输入 z_LR (latent) + timestep t，输出残差 Δ，使得 z_LR + Δ ≈ z_HR。
-复用 Flux 的 RoPE、timestep embedding、SingleStreamBlock、LastLayer。
+将 LR latent 嵌入到预训练 T2I 的整流流中。
+输入 z_LR (latent) + timestep t，输出预测噪声 ε_pred，
+替代随机高斯噪声作为去噪初始状态，使整流流路径更适配输入图像。
 """
 
 from __future__ import annotations
@@ -89,23 +89,17 @@ class FlowEmbedder(nn.Module):
             for _ in range(depth)
         ])
 
-        # ---- 输出投影 ----
+        # 输出投影（保持默认初始化，不零初始化，因为输出是噪声而非残差）
         self.final_layer = LastLayer(
             hidden_size, 1, out_channels,
         )
 
-        self._init_weights()
+        # 不需要零初始化 final_layer，模型需要从随机状态学习预测噪声
 
     # ------------------------------------------------------------------
-    # 权重初始化：残差输出层零初始化，确保训练初期 Δ ≈ 0
+    # 权重初始化：不使用零初始化，因为输出是噪声而非残差
+    # 模型从默认的 Linear 初始化开始学习
     # ------------------------------------------------------------------
-    def _init_weights(self):
-        nn.init.zeros_(self.final_layer.linear.weight)
-        nn.init.zeros_(self.final_layer.linear.bias)
-        adaLN_linear = self.final_layer.adaLN_modulation[-1]
-        assert isinstance(adaLN_linear, nn.Linear)
-        nn.init.zeros_(adaLN_linear.weight)
-        nn.init.zeros_(adaLN_linear.bias)
 
     # ------------------------------------------------------------------
     # Pack / Unpack — 与 Flux 的 sampling.py 保持一致
@@ -143,7 +137,7 @@ class FlowEmbedder(nn.Module):
             timesteps: [B]            float in [0, 1]
 
         Returns:
-            delta:     [B, 16, H, W]  嵌入残差
+            eps_pred:  [B, 16, H, W]  预测噪声，替代随机高斯噪声用于整流流初始状态
         """
         b, c, h, w = z_lr.shape
         h_half, w_half = h // 2, w // 2   # pack 后的 grid 尺寸
@@ -171,10 +165,10 @@ class FlowEmbedder(nn.Module):
         # 6. 输出投影
         img = self.final_layer(img, vec)               # [B, seq, 64]
 
-        # 7. unpack → 残差
-        delta = self.unpack(img, h_half, w_half)       # [B, 16, H, W]
+        # 7. unpack → 预测噪声
+        eps_pred = self.unpack(img, h_half, w_half)    # [B, 16, H, W]
 
-        return delta
+        return eps_pred
 
 
 def create_flow_embedder(config_path: str) -> FlowEmbedder:

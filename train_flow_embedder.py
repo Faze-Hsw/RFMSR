@@ -310,20 +310,19 @@ class FlowEmbedderTrainer:
         z_hr = z_hr.detach().float()
         z_lr = z_lr.detach().float()
 
-        # 2. 时间步 t + 噪声 ε
+        # 2. 时间步 t
         logit_mean = tcfg.get("logit_normal_mean", 0.0)
         logit_std = tcfg.get("logit_normal_std", 1.0)
         t = torch.sigmoid(torch.randn(bs, device=device) * logit_std + logit_mean)
-        eps = torch.randn_like(z_hr)
 
         # ══════════════════════════════════════════
         # Generator 前向
         # ══════════════════════════════════════════
         with autocast(device_type="cuda", enabled=self.use_amp):
-            delta = self.embedder(z_lr, t)               # [B,16,64,64]
-            z_corrected = z_lr + delta
+            eps_pred = self.embedder(z_lr, t)               # [B,16,64,64] 预测噪声
             t_expand = t[:, None, None, None]
-            x_t = (1.0 - t_expand) * z_corrected + t_expand * eps
+            # 用预测噪声替代随机高斯构造整流流初始状态
+            x_t = (1.0 - t_expand) * z_lr + t_expand * eps_pred
 
         x_t_packed = self.pack(x_t.to(torch.bfloat16))
         _, _, h_lat, w_lat = z_hr.shape
@@ -334,25 +333,23 @@ class FlowEmbedderTrainer:
         # 3. 一步 Euler 重构 z_pred = x_t - t * v_pred
         z_pred_packed = x_t_packed - t[:, None, None].to(torch.bfloat16) * v_pred
 
-        # 4. Unpack → VAE decode 到像素空间
+        # 4. Unpack → 潜空间 L2（跳过 VAE decode，更快且稳定）
         z_pred_spatial = rearrange(
             z_pred_packed, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
             h=h_pack, w=w_pack, ph=2, pw=2,
         )
-        # VAE decode（sr_img 用梯度检查点省显存，hr_img 无需梯度）
-        sr_img = torch.utils.checkpoint.checkpoint(
-            lambda z: self.ae.decode(z), z_pred_spatial.to(torch.bfloat16),
-            use_reentrant=False,
-        )
-        with torch.no_grad():
-            hr_img = self.ae.decode(z_hr.to(torch.bfloat16))
 
-        # 像素空间 L2
-        loss_l2 = F.mse_loss(sr_img.float(), hr_img.float())
+        loss_l2 = F.mse_loss(z_pred_spatial.float(), z_hr.float())
         losses = {"l2": loss_l2.item()}
 
-        # LPIPS（可选）
+        # LPIPS（可选，需要解码到像素空间）
         if self.lpips_weight > 0 and self.lpips_loss is not None:
+            sr_img = torch.utils.checkpoint.checkpoint(
+                lambda z: self.ae.decode(z), z_pred_spatial.to(torch.bfloat16),
+                use_reentrant=False,
+            )
+            with torch.no_grad():
+                hr_img = self.ae.decode(z_hr.to(torch.bfloat16))
             # LPIPS 需要 [0, 1] 输入
             sr_norm = (sr_img.float() + 1.0) / 2.0
             hr_norm = (hr_img.float() + 1.0) / 2.0
@@ -373,11 +370,11 @@ class FlowEmbedderTrainer:
                 z_pred_spatial.to(torch.float32),
                 t, txt_batch, vec_batch,
             )
-            loss_gan = gen_loss(logits_fake)
+            loss_gan_raw = gen_loss(logits_fake)
+            losses["gan"] = loss_gan_raw.item()
             w_max = dcfg.get("w_max", 0.1)
             gan_weight = w_max * t.mean()
-            loss_gan = loss_gan * gan_weight
-            losses["gan"] = loss_gan.item()
+            loss_gan = loss_gan_raw * gan_weight
 
         loss = loss_l2 + self.lpips_weight * loss_lpips + loss_gan
         if self.lpips_weight > 0:
@@ -553,8 +550,11 @@ class FlowEmbedderTrainer:
         )
 
         # 累计损失，每 log_freq 步输出一次平均值
-        loss_ema = 0.0
-        loss_cnt = 0
+        ema_l2 = 0.0
+        ema_lpips = 0.0
+        ema_gan = 0.0
+        ema_d = 0.0
+        ema_cnt = 0
 
         try:
             while self.global_step < total_iters:
@@ -567,8 +567,11 @@ class FlowEmbedderTrainer:
                 loss_dict = self.train_step(batch)
                 self.global_step += 1
 
-                loss_ema += loss_dict.get("l2", 0)
-                loss_cnt += 1
+                ema_l2 += loss_dict.get("l2", 0)
+                ema_lpips += loss_dict.get("lpips", 0)
+                ema_gan += loss_dict.get("gan", 0)
+                ema_d += loss_dict.get("d", 0)
+                ema_cnt += 1
 
                 # 进度条显示当前步 loss
                 postfix = {"l2": f"{loss_dict.get('l2', 0):.4f}"}
@@ -583,14 +586,30 @@ class FlowEmbedderTrainer:
 
                 # 每 log_freq 步输出平均损失
                 if self.global_step % self.log_freq == 0:
-                    avg_loss = loss_ema / max(loss_cnt, 1)
+                    avg_l2 = ema_l2 / max(ema_cnt, 1)
+                    avg_lpips = ema_lpips / max(ema_cnt, 1)
+                    avg_gan = ema_gan / max(ema_cnt, 1)
+                    avg_d = ema_d / max(ema_cnt, 1)
                     lr = self.optimizer.param_groups[0]['lr']
+
+                    parts = [f"l2={avg_l2:.6f}"]
+                    if ema_lpips > 0:
+                        parts.append(f"lpips={avg_lpips:.6f}")
+                    if ema_gan != 0:
+                        parts.append(f"gan={avg_gan:.6f}")
+                    if ema_d != 0:
+                        parts.append(f"d={avg_d:.6f}")
                     print(
                         f"\n[step {self.global_step}/{total_iters}] "
-                        f"l2={avg_loss:.6f}  lr={lr:.2e}"
+                        + "  ".join(parts)
+                        + f"  lr={lr:.2e}"
                     )
-                    loss_ema = 0.0
-                    loss_cnt = 0
+
+                    ema_l2 = 0.0
+                    ema_lpips = 0.0
+                    ema_gan = 0.0
+                    ema_d = 0.0
+                    ema_cnt = 0
 
                 if self.global_step % self.save_freq == 0:
                     self.save_checkpoint(self.global_step)

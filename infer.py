@@ -238,17 +238,17 @@ class FluxInferencer:
         latent = self.vae_encode_tensor(image_tensor)  # [B,16,H//8,W//8]
         b, c, h_lat, w_lat = latent.shape
 
-        # 1.5) Flow Embedder 修正（若有）
+        # 1.5) Flow Embedder 预测噪声（若有），替代随机高斯噪声
         if hasattr(self, 'flow_embedder'):
             t_start = torch.full((b,), start_timestep, device=self.denoise_device, dtype=torch.bfloat16)
             with torch.no_grad():
-                delta = self.flow_embedder(latent.to(torch.bfloat16), t_start)
-            latent = latent + delta.to(latent.dtype)
-            self.print(f"   FlowEmbedder applied, t={start_timestep}")
-
-        # 2) 生成噪声（spatial 格式，与 latent 同尺寸）
-        noise = get_noise(batch_size, h_pix, w_pix, device,
-                          dtype=torch.bfloat16, seed=seed)
+                noise = self.flow_embedder(latent.to(torch.bfloat16), t_start)
+            noise = noise.to(dtype=torch.bfloat16)
+            self.print(f"   FlowEmbedder predicted noise, t={start_timestep}")
+        else:
+            # 2) 没有 Flow Embedder 时使用随机高斯噪声
+            noise = get_noise(batch_size, h_pix, w_pix, device,
+                              dtype=torch.bfloat16, seed=seed)
 
         # 3) Prepare 条件（使用预编码的 txt/vec，不重复调 T5/CLIP）
         with torch.no_grad():
