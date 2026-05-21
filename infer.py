@@ -32,15 +32,14 @@ from utils.image_spliter import ImageSpliterTh
 #################################################################################################
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "infer.yaml")
+_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "infer.yaml")
 
 
-def load_config(config_path: str = None) -> dict:
-    path = config_path or _DEFAULT_CONFIG_PATH
-    if not os.path.exists(path):
-        print(f"⚠️  配置文件 {path} 不存在，使用内置默认值")
+def load_config() -> dict:
+    if not os.path.exists(_CONFIG_PATH):
+        print(f"⚠️  配置文件 {_CONFIG_PATH} 不存在，使用内置默认值")
         return {}
-    with open(path, "r", encoding="utf-8") as f:
+    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
     return cfg
 

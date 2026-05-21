@@ -45,7 +45,9 @@ except ImportError:
 
 class FlowEmbedderTrainer:
 
-    def __init__(self, config_path: str):
+    def __init__(self):
+        _script_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(_script_dir, "configs", "train_flow_embedder.yaml")
         with open(config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
 
@@ -609,11 +611,10 @@ class FlowEmbedderTrainer:
 
 def main():
     parser = argparse.ArgumentParser(description="Train Flow Embedder Δ_φ")
-    parser.add_argument("--config", type=str, default="configs/train_flow_embedder.yaml")
     parser.add_argument("--resume", type=str, default=None, help="Path to training state checkpoint")
     args = parser.parse_args()
 
-    trainer = FlowEmbedderTrainer(args.config)
+    trainer = FlowEmbedderTrainer()
     if args.resume:
         trainer.load_checkpoint(args.resume)
     trainer.train()
