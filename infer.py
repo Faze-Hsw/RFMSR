@@ -285,8 +285,7 @@ class FluxInferencer:
         # 4) 获取时间步调度（从 start_timestep 到 0，固定 steps 步）
         seq_len = packed_latent.shape[1]
         timesteps = get_schedule(steps, seq_len, start_timestep=start_timestep, shift=shift)
-        self.print(f"   Timestep schedule ({len(timesteps)} steps): "
-                   f"[{timesteps[0]:.4f}, {timesteps[1]:.4f}, ..., {timesteps[-2]:.4f}, {timesteps[-1]:.4f}]")
+        self.print(f"   Timesteps: {[f'{t:.2f}' for t in timesteps]}")
 
         # 5) 去噪（内部处理 img2img 混合）
         packed_result = self.do_sampling(
