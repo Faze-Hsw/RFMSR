@@ -1,6 +1,6 @@
 """
-Latent Discriminator — 无条件多尺度 UNet 判别器
-在 Flux 潜空间（16 通道）上做真伪判别，仅基于图像本身，无文本/时间步条件。
+Latent Discriminator — 无条件 UNet 判别器
+在 Flux 潜空间（16 通道）上做 PatchGAN 真伪判别，仅基于图像本身。
 
 包含 GAN 损失函数：
   - hinge_d_loss: 判别器 Hinge 损失
@@ -82,7 +82,7 @@ class UpBlock2D(nn.Module):
 
 class LatentDiscriminator(nn.Module):
     """
-    无条件多尺度 UNet 判别器，仅接受 Flux 潜空间图像输入。
+    无条件 UNet 判别器，仅接受 Flux 潜空间图像输入。
 
     Args:
         in_channels:       输入通道数（Flux VAE = 16）
@@ -121,25 +121,25 @@ class LatentDiscriminator(nn.Module):
         mid_ch = block_out_channels[-1]
         self.mid_block = nn.Sequential(ResnetBlock2D(mid_ch, mid_ch))
 
-        # 输出头
-        self.out_blocks = nn.ModuleList()
-        self.out_blocks.append(self._make_out_head(mid_ch))
+        # 输出头（最终全分辨率单头输出）
 
-        # 上采样路径
+        # 上采样路径（对称恢复至原始分辨率）
         self.up_blocks = nn.ModuleList()
         rev_channels = list(reversed(block_out_channels))
         rev_layers = list(reversed(layers_per_block))
-        for i in range(n_levels - 1):
+        for i in range(n_levels):
             in_ch = rev_channels[i]
-            out_ch = rev_channels[i + 1]
-            n_layers = rev_layers[i + 1]
-            is_last = (i == n_levels - 2)
+            is_last = (i == n_levels - 1)
+            out_ch = rev_channels[i + 1] if i + 1 < n_levels else rev_channels[i]
+            n_layers = rev_layers[i]
             block = UpBlock2D(
                 in_ch, out_ch, n_layers,
                 skip_ch=in_ch, add_up=not is_last,
             )
             self.up_blocks.append(block)
-            self.out_blocks.append(self._make_out_head(out_ch))
+
+        # 最终输出头：128ch → 1ch logit map
+        self.out_block = self._make_out_head(block_out_channels[0])
 
     def _make_out_head(self, ch):
         return nn.Sequential(
@@ -156,7 +156,7 @@ class LatentDiscriminator(nn.Module):
         Args:
             sample: [B, 16, H, W] Flux latent
         Returns:
-            list of [B, 1, h, w] logit maps at different scales
+            [B, 1, H, W] logit map（与输入同分辨率）
         """
         sample = sample.float()
 
@@ -177,16 +177,12 @@ class LatentDiscriminator(nn.Module):
         # 中间块
         sample = self.mid_block(sample)
 
-        # 输出头 0（瓶颈）
-        out = [self.out_blocks[0](sample)]
-
-        # 上采样 + 多尺度输出
+        # 上采样 + skip connections
         for i, block in enumerate(self.up_blocks):
             res_hidden = skips.pop()
             sample = block(sample, res_hidden_states=res_hidden)
-            out.append(self.out_blocks[i + 1](sample))
 
-        return out
+        return self.out_block(sample)
 
 
 # ═══════════════════════════════════════════════
@@ -194,7 +190,7 @@ class LatentDiscriminator(nn.Module):
 # ═══════════════════════════════════════════════
 
 def hinge_d_loss(logits_real, logits_fake):
-    """判别器 Hinge 损失。支持多尺度 logits 列表。"""
+    """判别器 Hinge 损失。"""
     if not isinstance(logits_real, list):
         logits_real, logits_fake = [logits_real], [logits_fake]
 
@@ -208,7 +204,7 @@ def hinge_d_loss(logits_real, logits_fake):
 
 
 def gen_loss(logits_fake):
-    """生成器非饱和 GAN 损失。支持多尺度 logits 列表。"""
+    """生成器非饱和 GAN 损失。"""
     if not isinstance(logits_fake, list):
         logits_fake = [logits_fake]
 

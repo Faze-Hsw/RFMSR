@@ -47,7 +47,7 @@ discriminator:
   dis_init_iterations: 1000  # 前 N 步只训生成器
   weight: 0.1                # GAN 损失权重
   lr: 5.0e-5
-  weight_decay: 1.0e-3
+  weight_decay: 1.0e-4
   params:
     in_channels: 16
     block_out_channels: [128, 256, 512]
