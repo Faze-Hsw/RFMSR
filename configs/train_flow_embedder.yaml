@@ -45,7 +45,7 @@ training:
 discriminator:
   enabled: true               # false=关闭 GAN，只用 L2 重构
   dis_init_iterations: 1000  # 前 N 步只训生成器
-  w_max: 0.1                  # GAN 最大权重 (实际 = w_max * t)
+  weight: 0.1                # GAN 损失权重
   lr: 5.0e-5
   weight_decay: 1.0e-3
   params:

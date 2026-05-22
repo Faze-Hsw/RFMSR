@@ -2,7 +2,7 @@
 Flow Embedder Δ_φ 训练脚本
 
 训练目标: 一步 Euler 重构损失 + 可选 GAN 对抗损失
-Loss = MSE(z_pred, z_HR) + w_max * t * GAN_loss(z_pred, z_HR)
+Loss = MSE(z_pred, z_HR) + w_gan * GAN_loss(z_pred, z_HR)
 其中 z_pred = x_t - t * v_θ(x_t, t), x_t = (1-t) * (z_LR + Δ_φ(z_LR, t)) + t * ε
 
 用法:
@@ -218,10 +218,10 @@ class FlowEmbedderTrainer:
         dcfg = self.cfg.get("discriminator", {})
         if dcfg.get("enabled", False) and self.discriminator is not None:
             dp = sum(p.numel() for p in self.discriminator.parameters())
-            print(f"Discriminator: {dp/1e6:.2f}M params, lr={dcfg.get('lr', 5e-5)}, w_max={dcfg.get('w_max', 0.1)}")
+            print(f"Discriminator: {dp/1e6:.2f}M params, lr={dcfg.get('lr', 5e-5)}, weight={dcfg.get('weight', 0.1)}")
         else:
             print("Discriminator: disabled")
-        print(f"Loss weights : L2=1.0, LPIPS={self.lpips_weight}, GAN(w_max)={dcfg.get('w_max', 0)} * t")
+        print(f"Loss weights : L2=1.0, LPIPS={self.lpips_weight}, GAN={dcfg.get('weight', 0)}")
         if dcfg.get("enabled"):
             print(f"  GAN warmup : {dcfg.get('dis_init_iterations', 0)} steps (generator L2+LPIPS only)")
         print("=" * 60 + "\n")
@@ -367,8 +367,7 @@ class FlowEmbedderTrainer:
             logits_fake = self.discriminator(z_pred_spatial.to(torch.float32))
             loss_gan_raw = gen_loss(logits_fake)
             losses["gan"] = loss_gan_raw.item()
-            w_max = dcfg.get("w_max", 0.1)
-            gan_weight = w_max * t.mean()
+            gan_weight = dcfg.get("weight", 0.1)
             loss_gan = loss_gan_raw * gan_weight
 
         loss = loss_l2 + self.lpips_weight * loss_lpips + loss_gan
@@ -482,6 +481,7 @@ class FlowEmbedderTrainer:
 
     def save_checkpoint(self, step: int):
         ckpt_dir = self.exp_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         # 推理权重（safetensors，仅含 tensor）
         weights = self.ema_state if self.ema_state is not None else self.embedder.state_dict()
