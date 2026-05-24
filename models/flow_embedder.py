@@ -217,21 +217,8 @@ class DecoderLevel(nn.Module):
         return x
 
 
-class Bottleneck(nn.Module):
-    """Bottleneck: ResBlock → SelfAttention → ResBlock."""
 
-    def __init__(self, channels: int, time_dim: int = 0,
-                 num_heads: int = 8, norm_groups: int = 32):
-        super().__init__()
-        self.res1 = ResBlock(channels, time_dim, norm_groups)
-        self.attn = SelfAttention2d(channels, num_heads, norm_groups)
-        self.res2 = ResBlock(channels, time_dim, norm_groups)
 
-    def forward(self, x: Tensor, t_emb: Tensor | None = None) -> Tensor:
-        x = self.res1(x, t_emb)
-        x = self.attn(x)
-        x = self.res2(x, t_emb)
-        return x
 
 
 # =========================================================================
