@@ -1,4 +1,4 @@
-# Flow Embedder 训练配置
+# Flow Embedder 训练配置 — Velocity Correction
 
 # ---- 模型架构（引用外部配置） ----
 model_config: configs/flow_embedder.yaml
@@ -8,7 +8,7 @@ data:
   hr_dir: traindata/
   degradation_config: configs/realesrgan_degradation.yaml
   gt_size: 512
-  batch_size: 12
+  batch_size: 16
   num_workers: 12
   use_hflip: true
   use_rot: false
@@ -18,8 +18,8 @@ flux:
   model_name: flux-dev
   prompt: "Cinematic, high-contrast, photo-realistic, 8k, ultra HD, meticulous detailing, hyper sharpness, perfect without deformations"
   guidance: 3.5
-  text_encoder_device: cuda    # T5+CLIP 所在设备（编码后释放）
-  denoise_device: cuda         # Flux+VAE 所在设备
+  text_encoder_device: cuda
+  denoise_device: cuda
   weights:
     t5xxl: checkpoints/t5xxl_fp16.safetensors
     clip: checkpoints/clip_l.safetensors
@@ -33,30 +33,9 @@ training:
   gradient_clip: 1.0
   use_amp: true
   ema_rate: 0.99
-  # 时间步采样：Logit-Normal 分布 t = sigmoid(N(mean, std²))
-  # mean=0, std=1 → 集中在 t≈0.5 附近，自然减少极端值
-  logit_normal_mean: 0.0
-  logit_normal_std: 1.0
   seed: 42
-  use_gradient_checkpointing: true     
-  gradient_checkpointing_chunk: 3      
-
-# ---- 判别器（GAN）----
-discriminator:
-  enabled: true               # false=关闭 GAN，只用 L2 重构
-  dis_init_iterations: 1000  # 前 N 步只训生成器
-  weight: 0.1                # GAN 损失权重
-  lr: 5.0e-5
-  weight_decay: 1.0e-4
-  params:
-    in_channels: 16
-    block_out_channels: [128, 256, 512]
-    layers_per_block: [1, 2, 2]
-
-# ---- LPIPS 感知损失（像素空间）----
-lpips:
-  weight: 2.0        # 0=关闭
-  net: vgg           # alex 或 vgg
+  use_gradient_checkpointing: true
+  gradient_checkpointing_chunk: 3
 
 # ---- 日志 & 保存 ----
 experiment:

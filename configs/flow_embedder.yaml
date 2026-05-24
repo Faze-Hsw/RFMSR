@@ -1,12 +1,15 @@
-# Signal Corrector Δ_φ 模型架构超参数
-# 基于 Flux SingleStreamBlock 的轻量 DiT
+# Flow Embedder — Velocity Correction U-Net 架构超参数
+# 流方向: t=0→HR, t=1→LR
+# 输入: x_t [16ch] + z_lr [16ch] + t [时间编码]
+# 输出: v_corr [16ch]
 
-in_channels: 64           # packed latent dim (16 latent_ch × 2×2 patch)
-out_channels: 64
-hidden_size: 768
-num_heads: 12
-depth: 12                 # SingleStreamBlock 层数
-mlp_ratio: 4.0
-axes_dim: [4, 30, 30]    # RoPE 维度分配，sum = hidden_size / num_heads = 64
-theta: 10000
-qkv_bias: true
+in_channels: 16               # 输入通道（x_t 和 z_lr 各自 16ch，concat 后 32ch）
+out_channels: 16              # 输出通道（v_corr 速度校正）
+base_channels: 128            # 基础通道数
+channel_multipliers: [1, 2, 4]       # 3级下采样: 128→256→512
+num_enc_blocks: 2             # 每级编码器 ResBlock 数
+num_dec_blocks: 3             # 每级解码器 ResBlock 数
+num_mid_blocks: 2             # 瓶颈层 ResBlock 数
+attn_heads: 8                 # 瓶颈注意力头数（0=关闭）
+norm_groups: 32               # GroupNorm 分组数
+time_emb_dim: 256             # 时间嵌入维度（正弦编码+MLP）
