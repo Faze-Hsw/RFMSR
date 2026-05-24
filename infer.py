@@ -49,7 +49,6 @@ _CFG = load_config()
 MODEL_NAME = _CFG.get("model_name", "flux-dev")
 PROMPT = _CFG.get("prompt", "")
 CFG_SCALE = _CFG.get("cfg", 3.5)
-STEPS = _CFG.get("steps", 28)
 SEED = _CFG.get("seed", 42)
 
 _WEIGHTS_CFG = _CFG.get("weights", {})
@@ -116,7 +115,7 @@ class FluxInferencer:
         self.flow_embedder = create_flow_embedder(config_path)
         sd = safe_load(ckpt_path)
         self.flow_embedder.load_state_dict(sd, strict=True)
-        self.flow_embedder = self.flow_embedder.to(self.denoise_device, dtype=torch.bfloat16)
+        self.flow_embedder = self.flow_embedder.to(self.denoise_device, dtype=torch.float32)
         self.flow_embedder.eval()
         n = sum(p.numel() for p in self.flow_embedder.parameters()) / 1e6
         print(f"  FlowEmbedder params: {n:.2f}M")
@@ -210,6 +209,10 @@ class FluxInferencer:
                     timesteps=t_batch.to(flux_dtype), y=vec, guidance=guidance_vec,
                 )
                 v_flux = self._unpack(v_flux_packed.float(), h_pack, w_pack)  # [B, 16, H, W]
+
+                # 与训练一致的 NaN/极端值净化
+                v_flux = torch.nan_to_num(v_flux, nan=0.0, posinf=10.0, neginf=-10.0)
+                v_flux = v_flux.clamp(-20.0, 20.0)
 
                 # Embedder 速度校正（原始 LR 图像作为条件上下文）
                 if hasattr(self, 'flow_embedder'):

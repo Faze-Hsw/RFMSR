@@ -18,7 +18,7 @@ prompt: "Cinematic, high-contrast, photo-realistic, 8k, ultra HD, meticulous det
 # 采样参数
 cfg: 3.5
 seed: 42
-scale: 1.0             # 放大倍数，输出尺寸 = 原图 × scale
+scale: 4.0             # 放大倍数，输出尺寸 = 原图 × scale
 shift: false           # 时间步 shift（高噪声区分配更多步数）
 
 # 逆流积分步数 (1.0 → 0.0, 步数越多质量越好但越慢)

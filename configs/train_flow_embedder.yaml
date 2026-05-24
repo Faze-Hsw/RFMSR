@@ -34,8 +34,6 @@ training:
   use_amp: true
   ema_rate: 0.99
   seed: 42
-  use_gradient_checkpointing: true
-  gradient_checkpointing_chunk: 3
 
 # ---- 日志 & 保存 ----
 experiment:

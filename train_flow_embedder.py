@@ -65,10 +65,6 @@ class FlowEmbedderTrainer:
         self.log_freq = exp["log_freq"]
         self.save_freq = exp["save_freq"]
 
-        # ---- 梯度检查点 ----
-        self.use_gradient_checkpointing = self.cfg["training"].get("use_gradient_checkpointing", True)
-        self.gradient_checkpointing_chunk = self.cfg["training"].get("gradient_checkpointing_chunk", 3)
-
         # ---- 加载模块 ----
         self._load_flux()
         self._encode_prompt()
@@ -106,7 +102,7 @@ class FlowEmbedderTrainer:
         print(f"Loading Flux '{name}' -> {device} ...")
         self.flux = load_flow_model(name, device=device, verbose=False)
         self.flux.requires_grad_(False)
-        self.flux.train()  # 保持 train() 使 grad checkpointing 生效
+        self.flux.eval()  # Flux 冻结，不需要 train()（无 dropout，梯度不穿透）
 
         print(f"Loading VAE -> {device} ...")
         self.ae = load_ae(name, device=device)
@@ -114,8 +110,6 @@ class FlowEmbedderTrainer:
         self.ae.requires_grad_(False)
 
         self.guidance = flux_cfg["guidance"]
-        self.flux.gradient_checkpointing = self.use_gradient_checkpointing
-        self.flux.gradient_checkpointing_chunk = self.gradient_checkpointing_chunk
 
         n_params = sum(p.numel() for p in self.flux.parameters())
         print(f"  Flux params: {n_params / 1e9:.2f}B (frozen, bf16)")

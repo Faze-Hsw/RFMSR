@@ -6,7 +6,7 @@
 
 in_channels: 16               # 输入通道（x_t 和 v_flux 各自 16ch）
 out_channels: 16              # 输出通道（v_corr 速度校正）
-base_channels: 128            # 基础通道数
+base_channels: 160            # 基础通道数
 channel_multipliers: [1, 2, 4]       # 3级下采样: 128→256→512
 num_enc_blocks: 3             # 每级编码器 ResBlock 数
 num_dec_blocks: 3             # 每级解码器 ResBlock 数
