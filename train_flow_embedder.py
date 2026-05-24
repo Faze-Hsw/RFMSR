@@ -279,6 +279,9 @@ class FlowEmbedderTrainer:
         B, C, H, W = z_hr.shape
         h_pack, w_pack = H // 2, W // 2
 
+        # LR image [-1, 1] for embedder conditioning (raw image space, not latent)
+        lr_raw = lr_up * 2.0 - 1.0  # [0,1] → [-1,1], [B, 3, H_pix, W_pix]
+
         # 2. 采样时间 t ~ U(0, 1)，构造流路径上的点 x_t
         t = torch.rand(B, device=device)  # [B] ∈ [0,1]
         t_expand = t[:, None, None, None]
@@ -299,8 +302,8 @@ class FlowEmbedderTrainer:
             v_flux = torch.nan_to_num(v_flux, nan=0.0, posinf=10.0, neginf=-10.0)
             v_flux = v_flux.clamp(-20.0, 20.0)
 
-            # Embedder 速度校正（残差：看到 Flux 偏了多少，直接补差）
-            v_corr = self.embedder(x_t, t, z_lr, v_flux)
+            # Embedder 速度校正（原始 LR 图像作为条件上下文）
+            v_corr = self.embedder(x_t, t, lr_raw, v_flux)
 
             # 总速度 = Flux + 校正
             v_total = v_flux + v_corr

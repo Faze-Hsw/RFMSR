@@ -146,6 +146,32 @@ class SelfAttention2d(nn.Module):
 
 
 # =========================================================================
+# LR Feature Extractor — 原始图像 → latent 空间特征
+# =========================================================================
+
+class LRFeatureExtractor(nn.Module):
+    """从原始 LR 图像提取特征并下采样 8× 对齐 latent 空间。
+
+    Input:  [B, 3, H_img, W_img]   raw LR image [-1,1]
+    Output: [B, out_ch, H_img/8, W_img/8]  feature map
+    """
+
+    def __init__(self, out_channels: int = 32):
+        super().__init__()
+        c = 16
+        self.net = nn.Sequential(
+            nn.Conv2d(3, c, 3, stride=2, padding=1),          # → H/2
+            nn.SiLU(),
+            nn.Conv2d(c, c * 2, 3, stride=2, padding=1),      # → H/4
+            nn.SiLU(),
+            nn.Conv2d(c * 2, out_channels, 3, stride=2, padding=1),  # → H/8
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+# =========================================================================
 # Encoder / Decoder levels
 # =========================================================================
 
@@ -217,14 +243,15 @@ class FlowEmbedder(nn.Module):
     Velocity correction network for Flux SR.
 
     Flow path: t=0 → HR, t=1 → LR
-    Inputs:  x_t    [B, 16, H, W]  — current state on flow path
-             t      [B]             — time scalar in [0, 1]
-             z_lr   [B, 16, H, W]  — LR latent for context
-             v_flux [B, 16, H, W]  — Flux predicted velocity (needs correction)
-    Output:  v_corr [B, 16, H, W]  — velocity correction
+    Inputs:  x_t      [B, 16, H, W]      — current state on flow path
+             t        [B]                 — time scalar in [0, 1]
+             lr_image [B, 3, H_img, W_img] — raw LR image [-1,1] (image space, not latent)
+             v_flux   [B, 16, H, W]      — Flux predicted velocity (needs correction)
+    Output:  v_corr   [B, 16, H, W]      — velocity correction
 
     Architecture (U-Net with time conditioning):
-      Concat(x_t, z_lr, v_flux) → [B, 48, H, W]
+      lr_image → LRFeatureExtractor(8×↓) → lr_feat [B, lr_feat_ch, H, W]
+      Concat(x_t, lr_feat, v_flux) → [B, 2*16+lr_feat_ch, H, W]
         → conv_in  → [B, 128, H, W]
         → Encoder (3↓: 128→256→512→512, time-FiLM)
         → Bottleneck (ResBlock+SA+ResBlock, time-FiLM)
@@ -244,6 +271,7 @@ class FlowEmbedder(nn.Module):
         attn_heads: int = 8,
         norm_groups: int = 32,
         time_emb_dim: int = 256,
+        lr_feat_channels: int = 32,
     ):
         super().__init__()
         if channel_multipliers is None:
@@ -257,8 +285,11 @@ class FlowEmbedder(nn.Module):
         # ---- Time embedding ----
         self.time_proj = TimeProjection(time_emb_dim, time_emb_dim)
 
-        # ---- conv_in: concat(x_t, z_lr, v_flux) = 3 * in_channels ----
-        self.conv_in = nn.Conv2d(in_channels * 3, enc_ch[0], 3, padding=1, bias=False)
+        # ---- LR Feature Extractor: raw image (3ch) → latent-space features ----
+        self.feature_extractor = LRFeatureExtractor(out_channels=lr_feat_channels)
+
+        # ---- conv_in: concat(x_t, lr_feat, v_flux) = 2*in_channels + lr_feat_channels ----
+        self.conv_in = nn.Conv2d(in_channels * 2 + lr_feat_channels, enc_ch[0], 3, padding=1, bias=False)
 
         # ---- Encoder ----
         self.enc_levels = nn.ModuleList()
@@ -306,13 +337,13 @@ class FlowEmbedder(nn.Module):
         if self.conv_out[-1].bias is not None:
             nn.init.zeros_(self.conv_out[-1].bias)
 
-    def forward(self, x_t: Tensor, t: Tensor, z_lr: Tensor, v_flux: Tensor) -> Tensor:
+    def forward(self, x_t: Tensor, t: Tensor, lr_image: Tensor, v_flux: Tensor) -> Tensor:
         """
         Args:
-            x_t:    [B, 16, H, W]  当前流路径上的状态
-            t:      [B]             时间 ∈ [0, 1]
-            z_lr:   [B, 16, H, W]  LR latent (条件上下文)
-            v_flux: [B, 16, H, W]  Flux 预测的速度 (detach, 无梯度)
+            x_t:      [B, 16, H, W]           当前流路径上的状态
+            t:        [B]                      时间 ∈ [0, 1]
+            lr_image: [B, 3, H_img, W_img]    原始 LR 图像 [-1, 1] (图像空间)
+            v_flux:   [B, 16, H, W]           Flux 预测的速度 (detach, 无梯度)
 
         Returns:
             v_corr: [B, 16, H, W]  速度校正量
@@ -320,8 +351,13 @@ class FlowEmbedder(nn.Module):
         # Time features
         t_emb = self.time_proj(t)  # [B, time_emb_dim]
 
-        # Concat input: x_t + z_lr + v_flux = 48 channels
-        x = torch.cat([x_t, z_lr, v_flux], dim=1)  # [B, 48, H, W]
+        # LR feature extraction: raw image → latent-space features
+        lr_feat = self.feature_extractor(lr_image)  # [B, lr_feat_ch, H_img/8, W_img/8]
+        if lr_feat.shape[-2:] != x_t.shape[-2:]:
+            lr_feat = F.interpolate(lr_feat, size=x_t.shape[-2:], mode="bilinear", align_corners=False)
+
+        # Concat input: x_t + lr_feat + v_flux
+        x = torch.cat([x_t, lr_feat, v_flux], dim=1)  # [B, 16*2+lr_feat_ch, H, W]
         x = self.conv_in(x)
 
         # ---- Encoder ----
@@ -369,16 +405,17 @@ if __name__ == "__main__":
 
     # Test forward
     B, C, H, W = 2, 16, 64, 64
+    H_img, W_img = H * 8, W * 8  # LR image size
     x_t = torch.randn(B, C, H, W)
     t = torch.rand(B)
-    z_lr = torch.randn(B, C, H, W)
+    lr_image = torch.randn(B, 3, H_img, W_img)  # raw LR image [-1,1]
     v_flux = torch.randn(B, C, H, W)
     model.eval()
     with torch.no_grad():
-        v_corr = model(x_t, t, z_lr, v_flux)
-    print(f"x_t:    {x_t.shape}")
-    print(f"t:      {t.shape} values={[f'{v:.3f}' for v in t.tolist()]}")
-    print(f"z_lr:   {z_lr.shape}")
-    print(f"v_flux: {v_flux.shape}")
-    print(f"v_corr: {v_corr.shape} mean={v_corr.mean():.6f} std={v_corr.std():.6f}")
+        v_corr = model(x_t, t, lr_image, v_flux)
+    print(f"x_t:      {x_t.shape}")
+    print(f"t:        {t.shape} values={[f'{v:.3f}' for v in t.tolist()]}")
+    print(f"lr_image: {lr_image.shape}")
+    print(f"v_flux:   {v_flux.shape}")
+    print(f"v_corr:   {v_corr.shape} mean={v_corr.mean():.6f} std={v_corr.std():.6f}")
     print("Forward pass OK — zero-init verified (near-zero output)")

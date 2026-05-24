@@ -155,23 +155,24 @@ class FluxInferencer:
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def reverse_flow_sampling(self, z_lr: torch.Tensor, steps: int = 28,
-                               guidance: float = 3.5, shift: bool = True) -> torch.Tensor:
+    def reverse_flow_sampling(self, z_lr: torch.Tensor, lr_image: torch.Tensor,
+                               steps: int = 28, guidance: float = 3.5,
+                               shift: bool = True) -> torch.Tensor:
         """
         从 LR 逆流积分到 HR。
 
         流方向: t=0→HR, t=1→LR
         逆流:   从 z_lr (t=1) 开始，逐步积分到 t=0:
                  x_{t_{i+1}} = x_{t_i} + (t_{i+1} - t_i) · v(x_{t_i}, t_i)
-                 其中 t_{i+1} < t_i, dt < 0, 逆流而行
 
-        v(x, t) = Flux(x, t) + embedder(x, t, z_lr)
+        v(x, t) = Flux(x, t) + embedder(x, t, lr_image)
 
         Args:
-            z_lr: [B, 16, H, W] spatial latent of LR
-            steps: 逆流积分步数
+            z_lr:     [B, 16, H, W]      spatial latent of LR (initial state)
+            lr_image: [B, 3, H_img, W_img] raw LR image [-1, 1] (embedder context)
+            steps:    逆流积分步数
             guidance: CFG 权重
-            shift: 是否启用 time shift
+            shift:    是否启用 time shift
 
         Returns:
             z_hr: [B, 16, H, W] spatial latent of HR
@@ -196,35 +197,33 @@ class FluxInferencer:
         # ---- 初始状态 x = z_lr (t=1) ----
         x = z_lr.clone()  # [B, 16, H, W], t=1
 
-        # ---- 逐步逆流积分 ----
+        # ---- 逐步逆流积分（autocast 统一 dtype，与训练保持一致）----
         step_pairs = list(zip(timesteps[:-1], timesteps[1:]))  # [(1.0, t1), (t1, t2), ..., (t_{-1}, 0.0)]
-        for t_curr, t_prev in tqdm(step_pairs, desc="Reverse flow", total=len(step_pairs), leave=False):
-            # Flux 速度预测
-            t_batch = torch.full((B,), t_curr, device=device)
-            x_packed = self._pack(x.to(flux_dtype))
-            v_flux_packed = self.model(
-                img=x_packed, img_ids=img_ids,
-                txt=txt, txt_ids=txt_ids,
-                timesteps=t_batch.to(flux_dtype), y=vec, guidance=guidance_vec,
-            )
-            v_flux = self._unpack(v_flux_packed.float(), h_pack, w_pack)  # [B, 16, H, W]
-
-            # Embedder 速度校正（残差学习）
-            if hasattr(self, 'flow_embedder'):
-                v_corr = self.flow_embedder(
-                    x.to(torch.bfloat16), t_batch,
-                    z_lr.to(torch.bfloat16), v_flux.to(torch.bfloat16),
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for t_curr, t_prev in tqdm(step_pairs, desc="Reverse flow", total=len(step_pairs), leave=False):
+                # Flux 速度预测
+                t_batch = torch.full((B,), t_curr, device=device)
+                x_packed = self._pack(x.to(flux_dtype))
+                v_flux_packed = self.model(
+                    img=x_packed, img_ids=img_ids,
+                    txt=txt, txt_ids=txt_ids,
+                    timesteps=t_batch.to(flux_dtype), y=vec, guidance=guidance_vec,
                 )
-                v_corr = v_corr.float()
-            else:
-                v_corr = torch.zeros_like(v_flux)
+                v_flux = self._unpack(v_flux_packed.float(), h_pack, w_pack)  # [B, 16, H, W]
 
-            # 总速度
-            v_total = v_flux + v_corr
+                # Embedder 速度校正（原始 LR 图像作为条件上下文）
+                if hasattr(self, 'flow_embedder'):
+                    v_corr = self.flow_embedder(x, t_batch, lr_image, v_flux)
+                    v_corr = v_corr.float()
+                else:
+                    v_corr = torch.zeros_like(v_flux)
 
-            # Euler 步: dt = t_prev - t_curr < 0 (逆流)
-            dt = t_prev - t_curr
-            x = x + dt * v_total
+                # 总速度
+                v_total = v_flux + v_corr
+
+                # Euler 步: dt = t_prev - t_curr < 0 (逆流)
+                dt = t_prev - t_curr
+                x = x + dt * v_total
 
         return x  # t=0 → z_hr
 
@@ -271,7 +270,8 @@ class FluxInferencer:
         """Spatial latent [B,16,H,W] → 像素 tensor [0,1]."""
         self.ae = self.ae.to(self.denoise_device)
         latent = latent.to(self.denoise_device)
-        image = self.ae.decode(latent)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            image = self.ae.decode(latent)
         image = image.float()
         image = torch.clamp((image + 1.0) / 2.0, min=0.0, max=1.0)
         return image
@@ -289,16 +289,16 @@ class FluxInferencer:
             steps: 逆流积分步数
         """
         device = self.denoise_device
-        h_pix, w_pix = image_patch.shape[-2:]
         batch_size = image_patch.shape[0]
 
         # 1) [0,1] → [-1,1] → VAE encode
-        image_tensor = image_patch * 2.0 - 1.0
-        z_lr = self.vae_encode_tensor(image_tensor)  # [B, 16, H//8, W//8]
+        image_tensor = image_patch * 2.0 - 1.0  # [B, 3, H, W] raw LR image
+        z_lr = self.vae_encode_tensor(image_tensor)  # [B, 16, H//8, W//8] LR latent
 
         # 2) 逆流积分: z_lr(t=1) → z_hr(t=0)
+        #    z_lr: initial state (latent), image_tensor: raw LR for embedder context
         z_hr = self.reverse_flow_sampling(
-            z_lr, steps=steps, guidance=cfg_scale, shift=shift,
+            z_lr, image_tensor, steps=steps, guidance=cfg_scale, shift=shift,
         )
 
         # 3) VAE decode → [0,1]
