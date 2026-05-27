@@ -1,12 +1,16 @@
 """
-Flux img2img 超分推理脚本 — 逆流积分版本
+Flux 超分推理脚本 — 两阶段流版本
 
-基于 HR→LR 整流流：t=0→HR, t=1→LR
-推理时从 z_lr (t=1) 逆流积分到 t=0 得到 z_hr:
-  x_{t-dt} = x_t - dt · (Flux(x_t, t) + embedder(x_t, t, z_lr))
+两阶段逆流积分:
+  Phase 1 (t=1 → switch_t): Embedder only — 起点纯噪声，零 OOD，锚定结构
+  Phase 2 (switch_t → t=0):   Flux only   — 质量精修，去伪影、加细节
 
-使用方法:
-  python infer.py --init_image input.png --scale 2.0
+训推一致:
+  - Embedder 起点 ε (纯噪声) → 与训练路径完全一致
+  - Flux 起点是半去噪 latent → 恰好是 Flux 训练分布中的中间态
+
+用法:
+  python infer.py --init_image input.png --scale 2.0 --switch_t 0.5
 """
 
 import os
@@ -74,6 +78,11 @@ T5_MAX_LENGTH = _CFG.get("t5_max_length", 512)
 
 # 推理步数（逆流积分步数）
 INFER_STEPS = _CFG.get("infer_steps", 28)
+
+# 两阶段切换时间点 switch_t ∈ [0,1]
+# t ∈ (switch_t, 1.0] → Embedder 锚定结构
+# t ∈ [0, switch_t]   → Flux 提升质量
+SWITCH_T = _CFG.get("switch_t", 0.5)
 
 
 #################################################################################################
@@ -155,26 +164,30 @@ class FluxInferencer:
 
     @torch.no_grad()
     def reverse_flow_sampling(self, z_lr: torch.Tensor, lr_image: torch.Tensor,
+                               switch_t: float = 0.5,
                                steps: int = 28, guidance: float = 3.5,
-                               shift: bool = True) -> torch.Tensor:
+                               shift: bool = True, seed: int = 42) -> torch.Tensor:
         """
-        从 LR 逆流积分到 HR。
+        两阶段逆流积分: t=1(纯噪声) → t=0(HR)
 
-        流方向: t=0→HR, t=1→LR
-        逆流:   从 z_lr (t=1) 开始，逐步积分到 t=0:
-                 x_{t_{i+1}} = x_{t_i} + (t_{i+1} - t_i) · v(x_{t_i}, t_i)
+        Phase 1 (t ∈ [switch_t, 1.0]): Embedder only — 从纯噪声锚定结构
+        Phase 2 (t ∈ [0, switch_t]):   Flux only   — 提升质量
 
-        v(x, t) = Flux(x, t) + embedder(x, t, lr_image)
+        训推一致:
+          - 起点 ε (纯噪声) → Embedder 训练分布完全匹配
+          - Flux 起点是半去噪 latent → 恰好在 Flux 训练分布中
 
         Args:
-            z_lr:     [B, 16, H, W]      spatial latent of LR (initial state)
-            lr_image: [B, 3, H_img, W_img] raw LR image [-1, 1] (embedder context)
-            steps:    逆流积分步数
-            guidance: CFG 权重
-            shift:    是否启用 time shift
+            z_lr:        [B, 16, H, W]    VAE latent of LR image
+            lr_image:    [B, 3, H, W]     raw LR image [-1,1]
+            switch_t:    切换时间点 ∈ [0,1]
+            steps:       逆流积分步数
+            guidance:    CFG 权重
+            shift:       是否启用 time shift
+            seed:        随机种子
 
         Returns:
-            z_hr: [B, 16, H, W] spatial latent of HR
+            z_hr: [B, 16, H, W]
         """
         device = z_lr.device
         B, C, H, W = z_lr.shape
@@ -189,45 +202,49 @@ class FluxInferencer:
         guidance_vec = torch.full((B,), guidance, device=device, dtype=flux_dtype)
         img_ids = self._make_img_ids(B, h_pack, w_pack, device)
 
-        # ---- 时间步调度：从 1.0 到 0.0 ----
-        timesteps = self._get_schedule(steps, seq_len, shift=shift)  # [1.0, ..., 0.0]
-        self.print(f"   Reverse flow: {steps} steps, t: 1.0 → 0.0{', shift' if shift else ''}")
+        # ---- 时间步调度: [1.0, ..., 0.0] ----
+        timesteps = self._get_schedule(steps, seq_len, shift=shift)
+        self.print(f"   2-stage flow: {steps} steps, t: 1.0 → 0.0"
+                   f"{', shift' if shift else ''}, switch_t={switch_t:.3f}")
 
-        # ---- 初始状态 x = z_lr (t=1) ----
-        x = z_lr.clone()  # [B, 16, H, W], t=1
+        # ---- 初始状态: 纯噪声 ε (训推一致!) ----
+        generator = torch.Generator(device=device).manual_seed(seed)
+        x = torch.randn(B, C, H, W, generator=generator, device=device)
 
-        # ---- 逐步逆流积分（autocast 统一 dtype，与训练保持一致）----
-        step_pairs = list(zip(timesteps[:-1], timesteps[1:]))  # [(1.0, t1), (t1, t2), ..., (t_{-1}, 0.0)]
+        # ---- 逐步逆流积分 ----
+        step_pairs = list(zip(timesteps[:-1], timesteps[1:]))
+        n_embed, n_flux = 0, 0  # counters for logging
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            for t_curr, t_prev in tqdm(step_pairs, desc="Reverse flow", total=len(step_pairs), leave=False):
-                # Flux 速度预测
+            for t_curr, t_prev in tqdm(step_pairs, desc="2-stage flow", total=len(step_pairs), leave=False):
                 t_batch = torch.full((B,), t_curr, device=device)
-                x_packed = self._pack(x.to(flux_dtype))
-                v_flux_packed = self.model(
-                    img=x_packed, img_ids=img_ids,
-                    txt=txt, txt_ids=txt_ids,
-                    timesteps=t_batch.to(flux_dtype), y=vec, guidance=guidance_vec,
-                )
-                v_flux = self._unpack(v_flux_packed.float(), h_pack, w_pack)  # [B, 16, H, W]
+                dt = t_prev - t_curr
 
-                # 与训练一致的 NaN/极端值净化
-                v_flux = torch.nan_to_num(v_flux, nan=0.0, posinf=10.0, neginf=-10.0)
-                v_flux = v_flux.clamp(-20.0, 20.0)
-
-                # Embedder 速度校正（原始 LR 图像作为条件上下文）
-                if hasattr(self, 'flow_embedder'):
-                    v_corr = self.flow_embedder(x, t_batch, lr_image, v_flux)
-                    v_corr = v_corr.float()
+                if t_curr > switch_t:
+                    # Phase 1: Embedder only — 从噪声中锚定结构
+                    if hasattr(self, 'flow_embedder'):
+                        v_total = self.flow_embedder(x, t_batch, lr_image).float()
+                    else:
+                        v_total = torch.zeros(B, C, H, W, device=device)
+                    n_embed += 1
                 else:
-                    v_corr = torch.zeros_like(v_flux)
+                    # Phase 2: Flux only — 提升质量
+                    x_packed = self._pack(x.to(flux_dtype))
+                    v_flux_packed = self.model(
+                        img=x_packed, img_ids=img_ids,
+                        txt=txt, txt_ids=txt_ids,
+                        timesteps=t_batch.to(flux_dtype), y=vec, guidance=guidance_vec,
+                    )
+                    v_total = self._unpack(v_flux_packed.float(), h_pack, w_pack)
 
-                # 总速度
-                v_total = v_flux + v_corr
+                    # 与训练一致的 NaN/极端值净化
+                    v_total = torch.nan_to_num(v_total, nan=0.0, posinf=10.0, neginf=-10.0)
+                    v_total = v_total.clamp(-20.0, 20.0)
+                    n_flux += 1
 
                 # Euler 步: dt = t_prev - t_curr < 0 (逆流)
-                dt = t_prev - t_curr
                 x = x + dt * v_total
 
+        self.print(f"   Steps: {n_embed} Embedder + {n_flux} Flux")
         return x  # t=0 → z_hr
 
     # ------------------------------------------------------------------
@@ -283,25 +300,21 @@ class FluxInferencer:
     # 处理 patch
     # ------------------------------------------------------------------
 
-    def process_patch(self, image_patch, seed, prompt, neg_prompt,
-                      steps, cfg_scale, shift=True):
-        """处理单个 patch：VAE encode → 逆流积分 → VAE decode。
+    def process_patch(self, image_patch, switch_t, seed, steps, cfg_scale, shift):
+        """处理单个 patch: VAE encode → 两阶段逆流积分 → VAE decode。
 
         Args:
             image_patch: [B,3,H,W] 像素 tensor [0,1]
-            steps: 逆流积分步数
+            switch_t: 两阶段切换点 ∈ [0,1]
         """
-        device = self.denoise_device
-        batch_size = image_patch.shape[0]
-
         # 1) [0,1] → [-1,1] → VAE encode
-        image_tensor = image_patch * 2.0 - 1.0  # [B, 3, H, W] raw LR image
-        z_lr = self.vae_encode_tensor(image_tensor)  # [B, 16, H//8, W//8] LR latent
+        image_tensor = image_patch * 2.0 - 1.0
+        z_lr = self.vae_encode_tensor(image_tensor)
 
-        # 2) 逆流积分: z_lr(t=1) → z_hr(t=0)
-        #    z_lr: initial state (latent), image_tensor: raw LR for embedder context
+        # 2) 两阶段逆流积分: t=1(纯噪声) → t=0(HR)
         z_hr = self.reverse_flow_sampling(
-            z_lr, image_tensor, steps=steps, guidance=cfg_scale, shift=shift,
+            z_lr, image_tensor, switch_t=switch_t,
+            steps=steps, guidance=cfg_scale, shift=shift, seed=seed,
         )
 
         # 3) VAE decode → [0,1]
@@ -314,7 +327,7 @@ class FluxInferencer:
 
     def gen_image(self, prompt="", neg_prompt="", steps=None,
                   cfg_scale=CFG_SCALE, seed=SEED, out_dir=OUTDIR,
-                  init_image=None, scale=1.0, shift=True,
+                  init_image=None, scale=1.0, switch_t=0.5, shift=True,
                   chopping_enabled=False, chopping_pch_size=512,
                   chopping_stride_ratio=0.5, chopping_extra_bs=1,
                   chopping_weight_type='Gaussian'):
@@ -325,8 +338,7 @@ class FluxInferencer:
         _steps = steps if steps is not None else INFER_STEPS
 
         image = self._gen_img2img(
-            init_image, scale, seed, prompt, neg_prompt,
-            _steps, cfg_scale, shift,
+            init_image, scale, switch_t, seed, _steps, cfg_scale, shift,
             chopping_enabled, chopping_pch_size,
             chopping_stride_ratio, chopping_extra_bs,
             chopping_weight_type,
@@ -338,7 +350,7 @@ class FluxInferencer:
         image.save(save_path)
         self.print("Done")
 
-    def _gen_img2img(self, init_image, scale, seed, prompt, neg_prompt,
+    def _gen_img2img(self, init_image, scale, switch_t, seed,
                      steps, cfg_scale, shift,
                      chopping_enabled, chopping_pch_size,
                      chopping_stride_ratio, chopping_extra_bs,
@@ -373,9 +385,9 @@ class FluxInferencer:
         )
 
         if not use_chopping:
-            print(f"📐 img2img 整张推理: {ori_w}x{ori_h}, {steps} steps")
+            print(f"📐 img2img 整张推理: {ori_w}x{ori_h}, switch_t={switch_t:.2f}, {steps} steps")
             res_sr = self.process_patch(
-                im_cond, seed, prompt, neg_prompt, steps, cfg_scale, shift,
+                im_cond, switch_t, seed, steps, cfg_scale, shift,
             )
         else:
             stride = int(idle_pch_size * chopping_stride_ratio)
@@ -392,7 +404,7 @@ class FluxInferencer:
                 patch_idx += len(index_infos)
                 print(f"   🧩 Patch {patch_idx}/{total_patches} ({im_pch.shape[-1]}x{im_pch.shape[-2]})")
                 res_pch = self.process_patch(
-                    im_pch, seed, prompt, neg_prompt, steps, cfg_scale, shift,
+                    im_pch, switch_t, seed, steps, cfg_scale, shift,
                 )
                 im_spliter.update(res_pch, index_infos)
 
@@ -426,6 +438,7 @@ def main(
     denoise_device=DENOISE_DEVICE,
     init_image=None,
     scale=SCALE,
+    switch_t=SWITCH_T,
     shift=SHIFT,
     t5_max_length=T5_MAX_LENGTH,
     chopping_enabled=CHOPPING_ENABLED,
@@ -435,10 +448,10 @@ def main(
     chopping_weight_type=CHOPPING_WEIGHT_TYPE,
     no_flow_embedder=False,
 ):
-    """Flux img2img 超分推理入口（逆流积分版本）。
+    """Flux 两阶段流超分推理。
 
-    流方向: HR(t=0) → LR(t=1)
-    推理:   从 LR(t=1) 逆流积分到 HR(t=0)
+    Phase 1 (t ∈ [switch_t, 1.0]): Embedder only — 纯噪声起点，锚定结构
+    Phase 2 (t ∈ [0, switch_t]):   Flux only   — 质量精修
     """
     _steps = steps if steps is not None else INFER_STEPS
     _cfg = cfg if cfg is not None else CFG_SCALE
@@ -469,7 +482,7 @@ def main(
     os.makedirs(out_dir, exist_ok=True)
     inferencer.gen_image(
         prompt, "", _steps, _cfg, seed, out_dir,
-        init_image=init_image, scale=scale, shift=shift,
+        init_image=init_image, scale=scale, switch_t=switch_t, shift=shift,
         chopping_enabled=chopping_enabled,
         chopping_pch_size=chopping_pch_size,
         chopping_stride_ratio=chopping_stride_ratio,

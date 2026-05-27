@@ -146,29 +146,65 @@ class SelfAttention2d(nn.Module):
 
 
 # =========================================================================
-# LR Feature Extractor — 原始图像 → latent 空间特征
+# LR Feature Extractor — 原始图像 → latent 空间特征（ResBlock 风格）
 # =========================================================================
+
+class LRFeatureResBlock(nn.Module):
+    """轻量 ResBlock: GroupNorm → SiLU → Conv → GroupNorm → SiLU → Conv + residual"""
+
+    def __init__(self, channels: int, norm_groups: int = 8):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(min(norm_groups, channels), channels)
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.norm2 = nn.GroupNorm(min(norm_groups, channels), channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        nn.init.zeros_(self.conv2.weight)  # zero-init for stability
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = self.conv2(F.silu(self.norm2(h)))
+        return x + h
+
 
 class LRFeatureExtractor(nn.Module):
     """从原始 LR 图像提取特征并下采样 8× 对齐 latent 空间。
+
+    3 级 ResBlock + stride-2 down，带 GroupNorm 和残差连接。
 
     Input:  [B, 3, H_img, W_img]   raw LR image [-1,1]
     Output: [B, out_ch, H_img/8, W_img/8]  feature map
     """
 
-    def __init__(self, out_channels: int = 32):
+    def __init__(self, out_channels: int = 32, norm_groups: int = 8):
         super().__init__()
         c = 16
-        self.net = nn.Sequential(
-            nn.Conv2d(3, c, 3, stride=2, padding=1),          # → H/2
-            nn.SiLU(),
-            nn.Conv2d(c, c * 2, 3, stride=2, padding=1),      # → H/4
-            nn.SiLU(),
-            nn.Conv2d(c * 2, out_channels, 3, stride=2, padding=1),  # → H/8
-        )
+
+        # Level 0: H → H/2
+        self.conv_in = nn.Conv2d(3, c, 3, stride=2, padding=1, bias=False)
+        self.norm0 = nn.GroupNorm(min(norm_groups, c), c)
+        self.block0 = LRFeatureResBlock(c, norm_groups)
+
+        # Level 1: H/2 → H/4
+        self.down1 = nn.Conv2d(c, c * 2, 3, stride=2, padding=1, bias=False)
+        self.norm1 = nn.GroupNorm(min(norm_groups, c * 2), c * 2)
+        self.block1 = LRFeatureResBlock(c * 2, norm_groups)
+
+        # Level 2: H/4 → H/8
+        self.down2 = nn.Conv2d(c * 2, out_channels, 3, stride=2, padding=1, bias=False)
+        self.norm2 = nn.GroupNorm(min(norm_groups, out_channels), out_channels)
+        self.block2 = LRFeatureResBlock(out_channels, norm_groups)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
+        x = F.silu(self.norm0(self.conv_in(x)))
+        x = self.block0(x)
+
+        x = F.silu(self.norm1(self.down1(x)))
+        x = self.block1(x)
+
+        x = F.silu(self.norm2(self.down2(x)))
+        x = self.block2(x)
+
+        return x
 
 
 # =========================================================================
@@ -233,8 +269,7 @@ class FlowEmbedder(nn.Module):
     Inputs:  x_t      [B, 16, H, W]      — current state on flow path
              t        [B]                 — time scalar in [0, 1]
              lr_image [B, 3, H_img, W_img] — raw LR image [-1,1] (image space, not latent)
-             v_flux   [B, 16, H, W]      — Flux predicted velocity (needs correction)
-    Output:  v_corr   [B, 16, H, W]      — velocity correction
+    Output:  v_super  [B, 16, H, W]      — super-resolution velocity (z_lr - z_hr direction)
 
     Architecture (U-Net with time conditioning):
       lr_image → LRFeatureExtractor(8×↓) → lr_feat [B, lr_feat_ch, H, W]
@@ -275,8 +310,8 @@ class FlowEmbedder(nn.Module):
         # ---- LR Feature Extractor: raw image (3ch) → latent-space features ----
         self.feature_extractor = LRFeatureExtractor(out_channels=lr_feat_channels)
 
-        # ---- conv_in: concat(x_t, lr_feat, v_flux) = 2*in_channels + lr_feat_channels ----
-        self.conv_in = nn.Conv2d(in_channels * 2 + lr_feat_channels, enc_ch[0], 3, padding=1, bias=False)
+        # ---- conv_in: concat(x_t, lr_feat) = in_channels + lr_feat_channels ----
+        self.conv_in = nn.Conv2d(in_channels + lr_feat_channels, enc_ch[0], 3, padding=1, bias=False)
 
         # ---- Encoder ----
         self.enc_levels = nn.ModuleList()
@@ -324,18 +359,19 @@ class FlowEmbedder(nn.Module):
         if self.conv_out[-1].bias is not None:
             nn.init.zeros_(self.conv_out[-1].bias)
 
-    def forward(self, x_t: Tensor, t: Tensor, lr_image: Tensor, v_flux: Tensor) -> Tensor:
+    def forward(self, x_t: Tensor, t: Tensor, lr_image: Tensor) -> Tensor:
         """
+        纯超分速度预测: z_lr → z_hr
+
         Args:
             x_t:      [B, 16, H, W]           当前流路径上的状态
             t:        [B]                      时间 ∈ [0, 1]
             lr_image: [B, 3, H_img, W_img]    原始 LR 图像 [-1, 1] (图像空间)
-            v_flux:   [B, 16, H, W]           Flux 预测的速度 (detach, 无梯度)
 
         Returns:
-            v_corr: [B, 16, H, W]  速度校正量
+            v_super: [B, 16, H, W]  超分速度 ≈ z_lr - z_hr
         """
-        # Time features
+        # Time embedding
         t_emb = self.time_proj(t)  # [B, time_emb_dim]
 
         # LR feature extraction: raw image → latent-space features
@@ -343,8 +379,8 @@ class FlowEmbedder(nn.Module):
         if lr_feat.shape[-2:] != x_t.shape[-2:]:
             lr_feat = F.interpolate(lr_feat, size=x_t.shape[-2:], mode="bilinear", align_corners=False)
 
-        # Concat input: x_t + lr_feat + v_flux
-        x = torch.cat([x_t, lr_feat, v_flux], dim=1)  # [B, 16*2+lr_feat_ch, H, W]
+        # Concat input: x_t + lr_feat
+        x = torch.cat([x_t, lr_feat], dim=1)  # [B, in_ch+lr_feat_ch, H, W]
         x = self.conv_in(x)
 
         # ---- Encoder ----
@@ -396,13 +432,11 @@ if __name__ == "__main__":
     x_t = torch.randn(B, C, H, W)
     t = torch.rand(B)
     lr_image = torch.randn(B, 3, H_img, W_img)  # raw LR image [-1,1]
-    v_flux = torch.randn(B, C, H, W)
     model.eval()
     with torch.no_grad():
-        v_corr = model(x_t, t, lr_image, v_flux)
-    print(f"x_t:      {x_t.shape}")
-    print(f"t:        {t.shape} values={[f'{v:.3f}' for v in t.tolist()]}")
-    print(f"lr_image: {lr_image.shape}")
-    print(f"v_flux:   {v_flux.shape}")
-    print(f"v_corr:   {v_corr.shape} mean={v_corr.mean():.6f} std={v_corr.std():.6f}")
+        v_super = model(x_t, t, lr_image)
+    print(f"x_t:       {x_t.shape}")
+    print(f"t:         {t.shape} values={[f'{v:.3f}' for v in t.tolist()]}")
+    print(f"lr_image:  {lr_image.shape}")
+    print(f"v_super:   {v_super.shape} mean={v_super.mean():.6f} std={v_super.std():.6f}")
     print("Forward pass OK — zero-init verified (near-zero output)")

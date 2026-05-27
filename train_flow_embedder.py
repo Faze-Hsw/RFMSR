@@ -1,22 +1,29 @@
 """
-Flow Embedder 速度校正训练脚本
+Flow Embedder 训练脚本 — 噪声→HR 去噪流版本
 
-训练目标: 在 HR→LR 整流流路径上，embedder 学习校正冻结 Flux 的速度预测。
+训练目标: Embedder 学习从噪声到 HR 的去噪流，以 LR 图像为条件。
+           与 Flux 学习同一类去噪任务，方向一致，天然兼容推理时的加权混合。
 
-流路径: t=0 → HR, t=1 → LR
-  x_t = (1-t)·z_hr + t·z_lr
-  v_gt = z_lr - z_hr
+流路径: t=0 → HR latent, t=1 → 纯高斯噪声 ε
+  x_t = (1-t)·z_hr + t·ε
+  v_gt = ε - z_hr (随 ε 种子变化，t 编码噪声强度)
 
-训练:  v_total = Flux(x_t, t).detach() + embedder(x_t, t, z_lr)
-       loss = MSE(v_total, z_lr - z_hr)
+训练损失:
+  loss = MSE(embedder(x_t, t, lr_image), ε - z_hr)
+
+推理时与 Flux 加权合并:
+  z_anchor = (1-a)·z_lr + a·ε
+  v_total = a·Flux(z_anchor, t) + (1-a)·embedder(z_anchor, t, lr_image)
+  - 两个模型都是去噪速度，方向一致，自然互补
 
 核心优势:
-  - Flux 完全冻结 + detach，梯度零穿透 12B 模型
-  - 直接监督速度场，embedder 收到满强度梯度
-  - 训推一致：训练学速度，推理积分速度
+  - 训练不需要 Flux，显存省 24GB+
+  - Embedder 与 Flux 学习同一类去噪流，推理时速度方向不冲突
+  - LR 图像作为条件，引导去噪方向偏向该特定 HR
+  - a 可调控制通用去噪(Flux) vs 特定重建(Embedder) 的平衡
 
 用法:
-  python train_flow_embedder.py --config configs/train_flow_embedder.yaml
+  python train_flow_embedder.py
 """
 
 import os
@@ -32,7 +39,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from einops import rearrange, repeat
 from torch.amp import GradScaler, autocast
 from safetensors.torch import save_file as safe_save
 from tqdm import tqdm
@@ -180,17 +186,18 @@ class FlowEmbedderTrainer:
             self.ema_state = None
 
     def _print_summary(self):
+        tcfg = self.cfg["training"]
         print("\n" + "=" * 60)
         print(f"Experiment      : {self.cfg['experiment']['name']}")
         print(f"Save dir        : {self.exp_dir}")
-        print(f"Iterations      : {self.cfg['training']['iterations']}")
+        print(f"Iterations      : {tcfg['iterations']}")
         print(f"Batch size      : {self.cfg['data']['batch_size']}")
-        print(f"LR              : {self.cfg['training']['lr']}")
+        print(f"LR              : {tcfg['lr']}")
         print(f"GT size         : {self.cfg['data']['gt_size']}")
-        print(f"Flow direction  : HR(t=0) → LR(t=1)")
-        print(f"Training target : velocity MSE (Flux detach, zero grad-penetration)")
+        print(f"Flow            : Noise→HR (HR@t=0, Noise@t=1)")
+        print(f"Embedder target : ε - z_hr (去噪速度，以 LR 为条件)")
+        print(f"Flux            : 不参与训练，仅推理时同向加权")
         print(f"AMP             : {self.use_amp}")
-        print(f"Loss            : velocity MSE = 1.0")
         print("=" * 60 + "\n")
 
     # ------------------------------------------------------------------
@@ -203,53 +210,6 @@ class FlowEmbedderTrainer:
         img = img.to(device=self.device, dtype=torch.bfloat16)
         img = img * 2.0 - 1.0
         return self.ae.encode(img)
-
-    # ------------------------------------------------------------------
-    # Pack / Unpack / img_ids
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def pack(x: torch.Tensor) -> torch.Tensor:
-        return rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
-
-    @staticmethod
-    def unpack(x_packed: torch.Tensor, h: int, w: int) -> torch.Tensor:
-        return rearrange(x_packed, "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-                         h=h, w=w, ph=2, pw=2)
-
-    @staticmethod
-    def make_img_ids(b: int, h_lat: int, w_lat: int, device: torch.device) -> torch.Tensor:
-        img_ids = torch.zeros(h_lat, w_lat, 3, device=device)
-        img_ids[..., 1] = torch.arange(h_lat, device=device)[:, None]
-        img_ids[..., 2] = torch.arange(w_lat, device=device)[None, :]
-        return repeat(img_ids, "h w c -> b (h w) c", b=b)
-
-    # ------------------------------------------------------------------
-    # Flux 前向（detach，梯度不穿透）
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _flux_forward_no_args(flux, x_t_packed, img_ids, txt, txt_ids, t_vec, vec, guidance_vec):
-        return flux(
-            img=x_t_packed, img_ids=img_ids,
-            txt=txt, txt_ids=txt_ids,
-            timesteps=t_vec, y=vec, guidance=guidance_vec,
-        )
-
-    def flux_velocity(self, x_t_packed: torch.Tensor, t: torch.Tensor,
-                      img_ids: torch.Tensor, bs: int) -> torch.Tensor:
-        """冻结 Flux 前向，返回速度预测。gradient 不穿透 Flux。"""
-        flux_dtype = x_t_packed.dtype
-        txt = self.cached_txt.expand(bs, -1, -1).to(self.device, dtype=flux_dtype)
-        txt_ids = self.cached_txt_ids.expand(bs, -1, -1).to(self.device)
-        vec = self.cached_vec.expand(bs, -1).to(self.device, dtype=flux_dtype)
-        t_vec = t.to(self.device, dtype=flux_dtype)
-        guidance_vec = torch.full((bs,), self.guidance, device=self.device, dtype=flux_dtype)
-
-        v = self._flux_forward_no_args(
-            self.flux, x_t_packed, img_ids, txt, txt_ids, t_vec, vec, guidance_vec,
-        )
-        return v.detach()  # ⬅ 关键：detach，梯度零穿透 Flux
 
     # ------------------------------------------------------------------
     # Training step
@@ -271,39 +231,26 @@ class FlowEmbedderTrainer:
         z_hr = z_hr.detach().float()
         z_lr = z_lr.detach().float()
         B, C, H, W = z_hr.shape
-        h_pack, w_pack = H // 2, W // 2
 
         # LR image [-1, 1] for embedder conditioning (raw image space, not latent)
         lr_raw = lr_up * 2.0 - 1.0  # [0,1] → [-1,1], [B, 3, H_pix, W_pix]
 
-        # 2. 采样时间 t ~ U(0, 1)，构造流路径上的点 x_t
+        # 2. 噪声→HR 去噪流: x_t = (1-t)·z_hr + t·ε
         t = torch.rand(B, device=device)  # [B] ∈ [0,1]
         t_expand = t[:, None, None, None]
-        x_t = (1.0 - t_expand) * z_hr + t_expand * z_lr  # [B, 16, H, W]
+        epsilon = torch.randn_like(z_hr)   # [B, 16, H, W]  纯高斯噪声
+        x_t = (1.0 - t_expand) * z_hr + t_expand * epsilon  # [B, 16, H, W]
 
-        # 真值速度
-        v_gt = z_lr - z_hr  # [B, 16, H, W]  沿直线恒定
+        # 真值速度: 从噪声推往 HR
+        v_gt = epsilon - z_hr  # [B, 16, H, W]  随 ε 变化，非恒定
 
-        # 3. Flux + Embedder + Loss（统一 AMP 域）
+        # 3. Embedder + Loss
         with autocast(device_type="cuda", enabled=self.use_amp):
-            # Flux 速度预测（detach, 零梯度穿透）
-            x_t_packed = self.pack(x_t.to(torch.bfloat16))
-            img_ids = self.make_img_ids(bs, h_pack, w_pack, device)
-            v_flux_packed = self.flux_velocity(x_t_packed, t, img_ids, bs)
-            v_flux = self.unpack(v_flux_packed.float(), h_pack, w_pack)
-
-            # Flux 对 SR latent 可能产出 NaN/极端值，净化后再进 embedder
-            v_flux = torch.nan_to_num(v_flux, nan=0.0, posinf=10.0, neginf=-10.0)
-            v_flux = v_flux.clamp(-20.0, 20.0)
-
-            # Embedder 速度校正（原始 LR 图像作为条件上下文）
-            v_corr = self.embedder(x_t, t, lr_raw, v_flux)
-
-            # 总速度 = Flux + 校正
-            v_total = v_flux + v_corr
+            # 去噪速度: v_super ≈ ε - z_hr, 以 LR 图像为条件
+            v_super = self.embedder(x_t, t, lr_raw)
 
             # 速度回归损失
-            loss = F.mse_loss(v_total, v_gt)
+            loss = F.mse_loss(v_super, v_gt)
 
         losses = {"velo": loss.item()}
 

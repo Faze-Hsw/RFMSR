@@ -1,8 +1,9 @@
-# Flux 超分推理配置 — 逆流积分版本
+# Flux 两阶段流超分推理配置
 # 参数优先级: CLI 参数 > 此配置文件 > 内置默认值
 #
-# 流方向: HR(t=0) → LR(t=1)
-# 推理:   从 LR(t=1) 逆流积分到 HR(t=0)
+# 两阶段逆流积分:
+#   Phase 1 (t ∈ [switch_t, 1.0]): Embedder only — 纯噪声起点，锚定结构
+#   Phase 2 (t ∈ [0, switch_t]):   Flux only   — 提升质量
 
 # 模型名称: flux-dev, flux-schnell 等
 model_name: flux-dev
@@ -20,6 +21,8 @@ cfg: 3.5
 seed: 42
 scale: 4.0             # 放大倍数，输出尺寸 = 原图 × scale
 shift: false           # 时间步 shift（高噪声区分配更多步数）
+
+switch_t: 0.5
 
 # 逆流积分步数 (1.0 → 0.0, 步数越多质量越好但越慢)
 infer_steps: 28
