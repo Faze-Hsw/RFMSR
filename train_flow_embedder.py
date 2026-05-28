@@ -1,26 +1,21 @@
 """
-Flow Embedder 训练脚本 — 噪声→HR 去噪流版本
+Flow Embedder 训练脚本 — LightningDiT 速度预测
 
-训练目标: Embedder 学习从噪声到 HR 的去噪流，以 LR 图像为条件。
-           与 Flux 学习同一类去噪任务，方向一致，天然兼容推理时的加权混合。
+训练目标: DiT Embedder 学习从噪声到 HR 的流匹配速度，以 LR latent 为条件。
 
 流路径: t=0 → HR latent, t=1 → 纯高斯噪声 ε
   x_t = (1-t)·z_hr + t·ε
-  v_gt = ε - z_hr (随 ε 种子变化，t 编码噪声强度)
+  v_gt = ε - z_hr
 
-训练损失:
-  loss = MSE(embedder(x_t, t, lr_image), ε - z_hr)
+架构 (VOSR LightningDiT, ~0.35B):
+  cat(z_lr[16ch], x_t[16ch]) → [B, 32, H, W]
+    → PatchEmbed(patch=2) → tokens
+    → 28× LightningDiTBlock (Self-Attn + RoPE + QKNorm + SwiGLU + AdaLN)
+    → unpatchify → v [16ch]
 
-推理时与 Flux 加权合并:
-  z_anchor = (1-a)·z_lr + a·ε
-  v_total = a·Flux(z_anchor, t) + (1-a)·embedder(z_anchor, t, lr_image)
-  - 两个模型都是去噪速度，方向一致，自然互补
-
-核心优势:
-  - 训练不需要 Flux，显存省 24GB+
-  - Embedder 与 Flux 学习同一类去噪流，推理时速度方向不冲突
-  - LR 图像作为条件，引导去噪方向偏向该特定 HR
-  - a 可调控制通用去噪(Flux) vs 特定重建(Embedder) 的平衡
+训推一致:
+  Phase 1 (高噪声): DiT Embedder 从纯噪声锚定结构
+  Phase 2 (低噪声): Flux 精修质量
 
 用法:
   python train_flow_embedder.py
@@ -30,7 +25,6 @@ import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import argparse
 import random
-import time
 from collections import OrderedDict
 from copy import deepcopy
 from pathlib import Path
@@ -44,8 +38,8 @@ from safetensors.torch import save_file as safe_save
 from tqdm import tqdm
 
 from datapipe.train_dataloader import create_train_dataloader
-from flux.util import load_flow_model, load_t5, load_clip, load_ae
-from models.flow_embedder import FlowEmbedder, create_flow_embedder
+from flux.util import load_ae
+from models.dit_flow_embedder import create_dit_flow_embedder
 
 
 # =========================================================================
@@ -70,10 +64,10 @@ class FlowEmbedderTrainer:
 
         self.log_freq = exp["log_freq"]
         self.save_freq = exp["save_freq"]
+        self.keep_last_n = exp.get("keep_last_n", 0)
 
         # ---- 加载模块 ----
-        self._load_flux()
-        self._encode_prompt()
+        self._load_vae()
         self._build_embedder()
         self._build_optimizer()
         self._build_dataloader()
@@ -99,57 +93,23 @@ class FlowEmbedderTrainer:
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    def _load_flux(self):
-        """加载冻结的 Flux DiT + VAE。"""
+    def _load_vae(self):
+        """只加载 VAE 编解码器（训练不需要 Flux DiT / T5 / CLIP）。"""
         flux_cfg = self.cfg["flux"]
         name = flux_cfg["model_name"]
         device = self.device
 
-        print(f"Loading Flux '{name}' -> {device} ...")
-        self.flux = load_flow_model(name, device=device, verbose=False)
-        self.flux.requires_grad_(False)
-        self.flux.eval()  # Flux 冻结，不需要 train()（无 dropout，梯度不穿透）
-
-        print(f"Loading VAE -> {device} ...")
+        print(f"Loading VAE '{name}' -> {device} ...")
         self.ae = load_ae(name, device=device)
         self.ae.eval()
         self.ae.requires_grad_(False)
-
-        self.guidance = flux_cfg["guidance"]
-
-        n_params = sum(p.numel() for p in self.flux.parameters())
-        print(f"  Flux params: {n_params / 1e9:.2f}B (frozen, bf16)")
-        print("✅ Flux + VAE loaded.")
-
-    def _encode_prompt(self):
-        """编码固定 prompt → 缓存，释放 T5/CLIP。"""
-        flux_cfg = self.cfg["flux"]
-        te_device = flux_cfg.get("text_encoder_device", "cuda")
-        prompt = flux_cfg["prompt"]
-        t5_max_length = flux_cfg.get("t5_max_length", 512)
-        weights = flux_cfg.get("weights", {})
-
-        print(f"Loading T5 + CLIP -> {te_device} ...")
-        t5 = load_t5(te_device, max_length=t5_max_length, ckpt_path=weights.get("t5xxl"))
-        clip = load_clip(te_device, ckpt_path=weights.get("clip"))
-
-        print(f"Encoding prompt: '{prompt[:60]}...'")
-        with torch.no_grad():
-            self.cached_txt = t5(prompt).to(self.device)
-            self.cached_vec = clip(prompt).to(self.device)
-        self.cached_txt_ids = torch.zeros(
-            1, self.cached_txt.shape[1], 3, dtype=torch.float32, device=self.device
-        )
-
-        del t5, clip
-        torch.cuda.empty_cache()
-        print("✅ Prompt encoded, T5+CLIP released.")
+        print("✅ VAE loaded.")
 
     def _build_embedder(self):
         cfg_path = self.cfg["model_config"]
-        self.embedder = create_flow_embedder(cfg_path).to(self.device)
+        self.embedder = create_dit_flow_embedder(cfg_path).to(self.device)
         n_params = sum(p.numel() for p in self.embedder.parameters())
-        print(f"✅ FlowEmbedder: {n_params / 1e6:.2f}M params")
+        print(f"✅ LightningDiT Embedder: {n_params / 1e6:.1f}M (~0.35B) params")
 
     def _build_optimizer(self):
         tcfg = self.cfg["training"]
@@ -195,8 +155,8 @@ class FlowEmbedderTrainer:
         print(f"LR              : {tcfg['lr']}")
         print(f"GT size         : {self.cfg['data']['gt_size']}")
         print(f"Flow            : Noise→HR (HR@t=0, Noise@t=1)")
-        print(f"Embedder target : ε - z_hr (去噪速度，以 LR 为条件)")
-        print(f"Flux            : 不参与训练，仅推理时同向加权")
+        print(f"Architecture    : LightningDiT (VOSR-style, ~0.35B)")
+        print(f"Conditioning    : LR latent (VAE-encoded upsampled LR)")
         print(f"AMP             : {self.use_amp}")
         print("=" * 60 + "\n")
 
@@ -226,14 +186,11 @@ class FlowEmbedderTrainer:
         # 1. VAE encode
         z_hr = self.vae_encode(hr)       # [B, 16, H/8, W/8]
         lr_up = F.interpolate(lr, size=hr.shape[-2:], mode="bicubic", align_corners=False)
-        z_lr = self.vae_encode(lr_up)    # [B, 16, H/8, W/8]
+        z_lr = self.vae_encode(lr_up)    # [B, 16, H/8, W/8]  ← LR latent 条件
 
         z_hr = z_hr.detach().float()
         z_lr = z_lr.detach().float()
         B, C, H, W = z_hr.shape
-
-        # LR image [-1, 1] for embedder conditioning (raw image space, not latent)
-        lr_raw = lr_up * 2.0 - 1.0  # [0,1] → [-1,1], [B, 3, H_pix, W_pix]
 
         # 2. 噪声→HR 去噪流: x_t = (1-t)·z_hr + t·ε
         t = torch.rand(B, device=device)  # [B] ∈ [0,1]
@@ -242,19 +199,16 @@ class FlowEmbedderTrainer:
         x_t = (1.0 - t_expand) * z_hr + t_expand * epsilon  # [B, 16, H, W]
 
         # 真值速度: 从噪声推往 HR
-        v_gt = epsilon - z_hr  # [B, 16, H, W]  随 ε 变化，非恒定
+        v_gt = epsilon - z_hr  # [B, 16, H, W]
 
-        # 3. Embedder + Loss
+        # 3. DiT Embedder + Loss (LR latent 条件)
         with autocast(device_type="cuda", enabled=self.use_amp):
-            # 去噪速度: v_super ≈ ε - z_hr, 以 LR 图像为条件
-            v_super = self.embedder(x_t, t, lr_raw)
-
-            # 速度回归损失
+            v_super = self.embedder(x_t, t, z_lr)
             loss = F.mse_loss(v_super, v_gt)
 
         losses = {"velo": loss.item()}
 
-        # 4. 反向传播（梯度只到 embedder）
+        # 4. 反向传播
         self.optimizer.zero_grad()
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
@@ -316,6 +270,29 @@ class FlowEmbedderTrainer:
         state_path = ckpt_dir / f"training_state_step{step}.pth"
         torch.save(state, state_path)
         print(f"💾 Checkpoint saved: step {step}")
+
+        # 清理旧检查点
+        if self.keep_last_n > 0:
+            self._cleanup_old_checkpoints(ckpt_dir)
+
+    def _cleanup_old_checkpoints(self, ckpt_dir: Path):
+        """只保留最近 N 个检查点，删除其余。"""
+        import re
+        # 收集所有检查点文件，按 step 分组
+        pattern = re.compile(r"(flow_embedder_step|training_state_step)(\d+)")
+        ckpt_steps: dict[int, list[Path]] = {}
+        for f in ckpt_dir.iterdir():
+            m = pattern.match(f.name)
+            if m:
+                s = int(m.group(2))
+                ckpt_steps.setdefault(s, []).append(f)
+
+        # 按 step 排序，删除超出 keep_last_n 的旧检查点
+        sorted_steps = sorted(ckpt_steps.keys(), reverse=True)
+        for step in sorted_steps[self.keep_last_n:]:
+            for f in ckpt_steps[step]:
+                f.unlink()
+            print(f"🗑️  Removed old checkpoint: step {step}")
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
@@ -388,7 +365,7 @@ class FlowEmbedderTrainer:
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Flow Embedder (Velocity Correction)")
+    parser = argparse.ArgumentParser(description="Train DiT Flow Embedder (LightningDiT)")
     parser.add_argument("--resume", type=str, default=None, help="Path to training state checkpoint")
     args = parser.parse_args()
 

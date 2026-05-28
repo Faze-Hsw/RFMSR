@@ -1,17 +1,19 @@
-# Flow Embedder — Velocity Correction U-Net 架构超参数
-# 流方向: t=0→HR, t=1→LR
-# 输入: x_t [16ch] + lr_image [3ch, raw] + v_flux [16ch] + t [时间编码]
-#       lr_image 经 LRFeatureExtractor(8×↓) → lr_feat [lr_feat_ch]
-# 输出: v_corr [16ch]
+# DiT Flow Embedder — LightningDiT 架构超参数
+# 输入: cat(z_lr[16ch], x_t[16ch]) → [B, 32, H, W]
+# 输出: v [16ch] (速度预测)
 
-in_channels: 16               # 输入通道（x_t 和 v_flux 各自 16ch）
-out_channels: 16              # 输出通道（v_corr 速度校正）
-base_channels: 160            # 基础通道数
-channel_multipliers: [1, 2, 4]       # 3级下采样: 128→256→512
-num_enc_blocks: 3             # 每级编码器 ResBlock 数
-num_dec_blocks: 3             # 每级解码器 ResBlock 数
-num_mid_blocks: 3             # 瓶颈层 ResBlock 数
-attn_heads: 16                 # 瓶颈注意力头数（0=关闭）
-norm_groups: 32               # GroupNorm 分组数
-time_emb_dim: 256             # 时间嵌入维度（正弦编码+MLP）
-lr_feat_channels: 32          # LR 特征提取器输出通道数（3ch raw→32ch feat, 8×↓）
+dit_arch:
+  input_size: 64              # latent H (512/8=64)
+  patch_size: 2               # patchify 尺寸
+  in_channels: 32             # z_lr(16) + x_t(16)
+  out_channels: 16            # velocity output
+  hidden_size: 1024           # 0.5B params
+  depth: 28                   # DiT block 层数
+  num_heads: 16               # 注意力头数
+  mlp_ratio: 4.0              # FFN 扩展比
+  use_qknorm: true            # Q/K RMSNorm
+  use_swiglu: true            # SwiGLU 激活
+  use_rope: true              # RoPE 位置编码
+  use_rmsnorm: true           # RMSNorm（非 LayerNorm）
+  wo_shift: false             # AdaLN 是否包含 shift
+  use_checkpoint: false       # 梯度检查点（省显存）

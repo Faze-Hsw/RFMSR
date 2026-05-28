@@ -39,14 +39,14 @@ verbose: true
 text_encoder_device: cuda
 denoise_device: cuda
 
-# 分块推理（Chopping）参数
+# 分块推理（Latent tiling, VOSR 风格）
+# tile_size / tile_overlap 是像素空间参数，自动转换为 latent 空间大小
+# tile_size=512 → latent 64×64 tile; overlap 最终由 max(px//8, lt//8) 决定
 chopping:
   enabled: true
-  pch_size: 1024
-  stride_ratio: 0.5
-  extra_bs: 1
-  weight_type: Gaussian
+  tile_size: 512
+  tile_overlap: 4
 
-# Flow Embedder 速度校正模块
+# DiT Flow Embedder (LightningDiT)
 flow_embedder_path: checkpoints/flow_embedder.safetensors
 no_flow_embedder: false

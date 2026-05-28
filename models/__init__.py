@@ -1,1 +1,1 @@
-from .flow_embedder import FlowEmbedder, create_flow_embedder
+from .dit_flow_embedder import DiTFlowEmbedder, create_dit_flow_embedder

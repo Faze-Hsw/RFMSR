@@ -1,4 +1,4 @@
-# Flow Embedder 训练配置 — Velocity Correction
+# DiT Flow Embedder 训练配置 — LightningDiT (VOSR-style, ~0.5B)
 
 # ---- 模型架构（引用外部配置） ----
 model_config: configs/flow_embedder.yaml
@@ -13,26 +13,19 @@ data:
   use_hflip: true
   use_rot: false
 
-# ---- Flux（冻结） ----
+# ---- VAE（冻结，仅编解码，训练不需要 Flux DiT / T5 / CLIP） ----
 flux:
   model_name: flux-dev
-  prompt: "Cinematic, high-contrast, photo-realistic, 8k, ultra HD, meticulous detailing, hyper sharpness, perfect without deformations"
-  guidance: 3.5
-  text_encoder_device: cuda
   denoise_device: cuda
-  weights:
-    t5xxl: checkpoints/t5xxl_fp16.safetensors
-    clip: checkpoints/clip_l.safetensors
-  t5_max_length: 512
 
 # ---- 训练 ----
 training:
-  iterations: 100000
+  iterations: 500000
   lr: 5.0e-5
-  weight_decay: 0
+  weight_decay: 0.0
   gradient_clip: 1.0
   use_amp: true
-  ema_rate: 0.99
+  ema_rate: 0.999
   seed: 42
 
 # ---- 日志 & 保存 ----
@@ -41,3 +34,4 @@ experiment:
   save_dir: experiments/flow_embedder
   log_freq: 1000
   save_freq: 1000
+  keep_last_n: 3

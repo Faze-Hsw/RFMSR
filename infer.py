@@ -1,13 +1,9 @@
 """
-Flux 超分推理脚本 — 两阶段流版本
+Flux 超分推理脚本 — DiT Embedder 两阶段流版本
 
 两阶段逆流积分:
-  Phase 1 (t=1 → switch_t): Embedder only — 起点纯噪声，零 OOD，锚定结构
-  Phase 2 (switch_t → t=0):   Flux only   — 质量精修，去伪影、加细节
-
-训推一致:
-  - Embedder 起点 ε (纯噪声) → 与训练路径完全一致
-  - Flux 起点是半去噪 latent → 恰好是 Flux 训练分布中的中间态
+  Phase 1 (t=1 → switch_t): DiT Embedder — 纯噪声起点，LR latent 条件，锚定结构
+  Phase 2 (switch_t → t=0): Flux         — 质量精修，去伪影、加细节
 
 用法:
   python infer.py --init_image input.png --scale 2.0 --switch_t 0.5
@@ -27,8 +23,7 @@ from tqdm import tqdm
 
 from safetensors.torch import load_file as safe_load
 from flux.util import load_flow_model, load_t5, load_clip, load_ae
-from models.flow_embedder import create_flow_embedder
-from utils.image_spliter import ImageSpliterTh
+from models.dit_flow_embedder import create_dit_flow_embedder
 
 
 #################################################################################################
@@ -67,10 +62,8 @@ DENOISE_DEVICE = _CFG.get("denoise_device", "cuda")
 
 _CHOPPING_CFG = _CFG.get("chopping", {})
 CHOPPING_ENABLED = _CHOPPING_CFG.get("enabled", False)
-CHOPPING_PCH_SIZE = _CHOPPING_CFG.get("pch_size", 1024)
-CHOPPING_STRIDE_RATIO = _CHOPPING_CFG.get("stride_ratio", 0.5)
-CHOPPING_EXTRA_BS = _CHOPPING_CFG.get("extra_bs", 1)
-CHOPPING_WEIGHT_TYPE = _CHOPPING_CFG.get("weight_type", "Gaussian")
+TILE_SIZE = _CHOPPING_CFG.get("tile_size", 512)          # pixel-space tile size
+TILE_OVERLAP = _CHOPPING_CFG.get("tile_overlap", 4)      # pixel-space overlap
 
 FLOW_EMBEDDER_PATH = _CFG.get("flow_embedder_path", None)
 NO_FLOW_EMBEDDER = _CFG.get("no_flow_embedder", False)
@@ -80,7 +73,7 @@ T5_MAX_LENGTH = _CFG.get("t5_max_length", 512)
 INFER_STEPS = _CFG.get("infer_steps", 28)
 
 # 两阶段切换时间点 switch_t ∈ [0,1]
-# t ∈ (switch_t, 1.0] → Embedder 锚定结构
+# t ∈ (switch_t, 1.0] → DiT Embedder 锚定结构
 # t ∈ [0, switch_t]   → Flux 提升质量
 SWITCH_T = _CFG.get("switch_t", 0.5)
 
@@ -117,18 +110,19 @@ class FluxInferencer:
         print("✅ Models loaded.")
 
     def load_flow_embedder(self, ckpt_path: str, config_path: str = None):
-        """加载训练好的 Flow Embedder 速度校正模块。"""
+        """加载训练好的 DiT Flow Embedder。"""
         if config_path is None:
             config_path = os.path.join(_SCRIPT_DIR, "configs", "flow_embedder.yaml")
-        print(f"Loading FlowEmbedder from {ckpt_path} ...")
-        self.flow_embedder = create_flow_embedder(config_path)
+        print(f"Loading DiT FlowEmbedder from {ckpt_path} ...")
+
+        self.flow_embedder = create_dit_flow_embedder(config_path)
         sd = safe_load(ckpt_path)
         self.flow_embedder.load_state_dict(sd, strict=True)
         self.flow_embedder = self.flow_embedder.to(self.denoise_device, dtype=torch.float32)
         self.flow_embedder.eval()
         n = sum(p.numel() for p in self.flow_embedder.parameters()) / 1e6
-        print(f"  FlowEmbedder params: {n:.2f}M")
-        print("✅ FlowEmbedder loaded.")
+        print(f"  Params: {n:.2f}M")
+        print("✅ DiT FlowEmbedder loaded.")
 
     def load_text_encoders(self, device="cuda", t5_max_length=T5_MAX_LENGTH,
                            t5xxl_path=None, clip_path=None):
@@ -159,42 +153,26 @@ class FluxInferencer:
         print("✅ Prompt encoded.")
 
     # ------------------------------------------------------------------
-    # 逆流积分采样（新核心逻辑）
+    # 逆流积分采样
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def reverse_flow_sampling(self, z_lr: torch.Tensor, lr_image: torch.Tensor,
+    def reverse_flow_sampling(self, z_lr: torch.Tensor,
                                switch_t: float = 0.5,
                                steps: int = 28, guidance: float = 3.5,
                                shift: bool = True, seed: int = 42) -> torch.Tensor:
         """
         两阶段逆流积分: t=1(纯噪声) → t=0(HR)
 
-        Phase 1 (t ∈ [switch_t, 1.0]): Embedder only — 从纯噪声锚定结构
-        Phase 2 (t ∈ [0, switch_t]):   Flux only   — 提升质量
-
-        训推一致:
-          - 起点 ε (纯噪声) → Embedder 训练分布完全匹配
-          - Flux 起点是半去噪 latent → 恰好在 Flux 训练分布中
-
-        Args:
-            z_lr:        [B, 16, H, W]    VAE latent of LR image
-            lr_image:    [B, 3, H, W]     raw LR image [-1,1]
-            switch_t:    切换时间点 ∈ [0,1]
-            steps:       逆流积分步数
-            guidance:    CFG 权重
-            shift:       是否启用 time shift
-            seed:        随机种子
-
-        Returns:
-            z_hr: [B, 16, H, W]
+        Phase 1 (t ∈ [switch_t, 1.0]): DiT Embedder — 纯噪声→锚定结构 (LR latent 条件)
+        Phase 2 (t ∈ [0, switch_t]):   Flux         — 质量精修
         """
         device = z_lr.device
         B, C, H, W = z_lr.shape
         h_pack, w_pack = H // 2, W // 2
         seq_len = h_pack * w_pack
 
-        # ---- 准备条件 ----
+        # ---- 准备 Flux 条件 ----
         flux_dtype = torch.bfloat16
         txt = self._cached_txt.expand(B, -1, -1).to(device, dtype=flux_dtype)
         txt_ids = self._cached_txt_ids.expand(B, -1, -1).to(device)
@@ -202,32 +180,32 @@ class FluxInferencer:
         guidance_vec = torch.full((B,), guidance, device=device, dtype=flux_dtype)
         img_ids = self._make_img_ids(B, h_pack, w_pack, device)
 
-        # ---- 时间步调度: [1.0, ..., 0.0] ----
+        # ---- 时间步调度 ----
         timesteps = self._get_schedule(steps, seq_len, shift=shift)
         self.print(f"   2-stage flow: {steps} steps, t: 1.0 → 0.0"
                    f"{', shift' if shift else ''}, switch_t={switch_t:.3f}")
 
-        # ---- 初始状态: 纯噪声 ε (训推一致!) ----
+        # ---- 初始状态: 纯噪声 ----
         generator = torch.Generator(device=device).manual_seed(seed)
         x = torch.randn(B, C, H, W, generator=generator, device=device)
 
         # ---- 逐步逆流积分 ----
         step_pairs = list(zip(timesteps[:-1], timesteps[1:]))
-        n_embed, n_flux = 0, 0  # counters for logging
+        n_embed, n_flux = 0, 0
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             for t_curr, t_prev in tqdm(step_pairs, desc="2-stage flow", total=len(step_pairs), leave=False):
                 t_batch = torch.full((B,), t_curr, device=device)
                 dt = t_prev - t_curr
 
                 if t_curr > switch_t:
-                    # Phase 1: Embedder only — 从噪声中锚定结构
+                    # Phase 1: DiT Embedder — LR latent 条件
                     if hasattr(self, 'flow_embedder'):
-                        v_total = self.flow_embedder(x, t_batch, lr_image).float()
+                        v_total = self.flow_embedder(x, t_batch, z_lr).float()
                     else:
                         v_total = torch.zeros(B, C, H, W, device=device)
                     n_embed += 1
                 else:
-                    # Phase 2: Flux only — 提升质量
+                    # Phase 2: Flux — 质量精修
                     x_packed = self._pack(x.to(flux_dtype))
                     v_flux_packed = self.model(
                         img=x_packed, img_ids=img_ids,
@@ -236,15 +214,15 @@ class FluxInferencer:
                     )
                     v_total = self._unpack(v_flux_packed.float(), h_pack, w_pack)
 
-                    # 与训练一致的 NaN/极端值净化
+                    # NaN/极端值净化
                     v_total = torch.nan_to_num(v_total, nan=0.0, posinf=10.0, neginf=-10.0)
                     v_total = v_total.clamp(-20.0, 20.0)
                     n_flux += 1
 
-                # Euler 步: dt = t_prev - t_curr < 0 (逆流)
+                # Euler 步
                 x = x + dt * v_total
 
-        self.print(f"   Steps: {n_embed} Embedder + {n_flux} Flux")
+        self.print(f"   Steps: {n_embed} DiT + {n_flux} Flux")
         return x  # t=0 → z_hr
 
     # ------------------------------------------------------------------
@@ -297,29 +275,129 @@ class FluxInferencer:
         return image
 
     # ------------------------------------------------------------------
-    # 处理 patch
+    # Latent tiling helpers (VOSR-style)
     # ------------------------------------------------------------------
 
-    def process_patch(self, image_patch, switch_t, seed, steps, cfg_scale, shift):
-        """处理单个 patch: VAE encode → 两阶段逆流积分 → VAE decode。
+    @staticmethod
+    def _make_tile_grid(length: int, tile: int, overlap: int):
+        """返回覆盖整个维度的 (start, end) tile 位置列表。每个 tile 大小 = tile。"""
+        stride = max(tile - overlap, 1)
+        if length <= tile:
+            return [(0, length)]
+        positions = list(range(0, length - tile + 1, stride))
+        if positions[-1] + tile < length:
+            positions.append(length - tile)
+        return [(p, p + tile) for p in sorted(set(positions))]
 
-        Args:
-            image_patch: [B,3,H,W] 像素 tensor [0,1]
-            switch_t: 两阶段切换点 ∈ [0,1]
-        """
-        # 1) [0,1] → [-1,1] → VAE encode
-        image_tensor = image_patch * 2.0 - 1.0
-        z_lr = self.vae_encode_tensor(image_tensor)
+    @staticmethod
+    def _gaussian_weights(tile_h: int, tile_w: int, channels: int, device: torch.device):
+        """2D 高斯融合权重，中心最高、边缘衰减。"""
+        var = 0.01
+        mid_h, mid_w = (tile_h - 1) / 2, (tile_w - 1) / 2
+        y = torch.arange(tile_h, dtype=torch.float32, device=device)
+        x = torch.arange(tile_w, dtype=torch.float32, device=device)
+        wy = torch.exp(-((y - mid_h) / tile_h) ** 2 / (2 * var))
+        wx = torch.exp(-((x - mid_w) / tile_w) ** 2 / (2 * var))
+        w = wy[:, None] * wx[None, :]
+        return w.unsqueeze(0).unsqueeze(0).expand(1, channels, -1, -1)
 
-        # 2) 两阶段逆流积分: t=1(纯噪声) → t=0(HR)
-        z_hr = self.reverse_flow_sampling(
-            z_lr, image_tensor, switch_t=switch_t,
-            steps=steps, guidance=cfg_scale, shift=shift, seed=seed,
-        )
+    # ------------------------------------------------------------------
+    # Tiled reverse flow sampling
+    # ------------------------------------------------------------------
 
-        # 3) VAE decode → [0,1]
-        result = self.vae_decode_tensor(z_hr)
-        return result
+    @torch.no_grad()
+    def reverse_flow_sampling_tiled(
+        self, z_lr: torch.Tensor,
+        switch_t: float = 0.5, steps: int = 28, guidance: float = 3.5,
+        shift: bool = True, seed: int = 42,
+        lt_size: int = 64, lt_overlap: int = 8,
+    ) -> torch.Tensor:
+        """Latent 空间分 tile 的两阶段逆流积分（VOSR 风格）。"""
+        device = z_lr.device
+        B, C, H, W = z_lr.shape
+        h_pack_full, w_pack_full = H // 2, W // 2
+        seq_len = h_pack_full * w_pack_full
+
+        # ---- Flux 条件（bfloat16，复用缓存） ----
+        flux_dtype = torch.bfloat16
+        txt = self._cached_txt.expand(B, -1, -1).to(device, dtype=flux_dtype)
+        txt_ids = self._cached_txt_ids.expand(B, -1, -1).to(device)
+        vec = self._cached_vec.expand(B, -1).to(device, dtype=flux_dtype)
+        guidance_vec = torch.full((B,), guidance, device=device, dtype=flux_dtype)
+
+        # ---- 时间步调度 ----
+        timesteps = self._get_schedule(steps, seq_len, shift=shift)
+        self.print(f"   Tiled 2-stage flow: {steps} steps, t: 1.0 → 0.0"
+                   f"{', shift' if shift else ''}, switch_t={switch_t:.3f}")
+        self.print(f"   Tile grid: {len(self._make_tile_grid(H, lt_size, lt_overlap))}×"
+                   f"{len(self._make_tile_grid(W, lt_size, lt_overlap))} "
+                   f"({lt_size}×{lt_size} latent, overlap={lt_overlap})")
+
+        # ---- 初始噪声 ----
+        generator = torch.Generator(device=device).manual_seed(seed)
+        x = torch.randn(B, C, H, W, generator=generator, device=device)
+
+        # ---- 高斯融合权重 ----
+        g_weight = self._gaussian_weights(lt_size, lt_size, C, device)
+
+        # ---- tile 网格 ----
+        h_tiles = self._make_tile_grid(H, lt_size, lt_overlap)
+        w_tiles = self._make_tile_grid(W, lt_size, lt_overlap)
+
+        # ---- 逐步逆流积分 ----
+        step_pairs = list(zip(timesteps[:-1], timesteps[1:]))
+        n_embed, n_flux = 0, 0
+
+        for t_curr, t_prev in tqdm(step_pairs, desc="Tiled flow", total=len(step_pairs), leave=False):
+            t_batch = torch.full((B,), t_curr, device=device)
+            dt = t_prev - t_curr
+
+            is_embedder_step = t_curr > switch_t
+            if is_embedder_step:
+                n_embed += 1
+            else:
+                n_flux += 1
+
+            # 累积器
+            v_acc = torch.zeros(B, C, H, W, device=device)
+            w_acc = torch.zeros(B, C, H, W, device=device)
+
+            for hs, he in h_tiles:
+                for ws, we in w_tiles:
+                    x_tile = x[:, :, hs:he, ws:we]       # [B, C, lt_size, lt_size]
+                    z_lr_tile = z_lr[:, :, hs:he, ws:we]
+
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        if is_embedder_step:
+                            # Phase 1: DiT Embedder
+                            if hasattr(self, 'flow_embedder'):
+                                v_tile = self.flow_embedder(x_tile, t_batch, z_lr_tile).float()
+                            else:
+                                v_tile = torch.zeros_like(x_tile)
+                        else:
+                            # Phase 2: Flux
+                            tile_hp, tile_wp = x_tile.shape[2] // 2, x_tile.shape[3] // 2
+                            tile_img_ids = self._make_img_ids(B, tile_hp, tile_wp, device)
+                            x_packed = self._pack(x_tile.to(flux_dtype))
+                            v_flux_packed = self.model(
+                                img=x_packed, img_ids=tile_img_ids,
+                                txt=txt, txt_ids=txt_ids,
+                                timesteps=t_batch.to(flux_dtype), y=vec, guidance=guidance_vec,
+                            )
+                            v_tile = self._unpack(v_flux_packed.float(), tile_hp, tile_wp)
+                            v_tile = torch.nan_to_num(v_tile, nan=0.0, posinf=10.0, neginf=-10.0)
+                            v_tile = v_tile.clamp(-20.0, 20.0)
+
+                    # 高斯加权累加
+                    v_acc[:, :, hs:he, ws:we] += v_tile * g_weight
+                    w_acc[:, :, hs:he, ws:we] += g_weight
+
+            # 归一化 + Euler 步
+            v_total = v_acc / w_acc.clamp(min=1e-8)
+            x = x + dt * v_total
+
+        self.print(f"   Steps: {n_embed} DiT + {n_flux} Flux")
+        return x
 
     # ------------------------------------------------------------------
     # 主入口
@@ -328,9 +406,7 @@ class FluxInferencer:
     def gen_image(self, prompt="", neg_prompt="", steps=None,
                   cfg_scale=CFG_SCALE, seed=SEED, out_dir=OUTDIR,
                   init_image=None, scale=1.0, switch_t=0.5, shift=True,
-                  chopping_enabled=False, chopping_pch_size=512,
-                  chopping_stride_ratio=0.5, chopping_extra_bs=1,
-                  chopping_weight_type='Gaussian'):
+                  chopping_enabled=False, tile_size=512, tile_overlap=32):
         """img2img 超分/增强。"""
         if init_image is None:
             raise ValueError("必须提供 init_image 参数。")
@@ -339,9 +415,7 @@ class FluxInferencer:
 
         image = self._gen_img2img(
             init_image, scale, switch_t, seed, _steps, cfg_scale, shift,
-            chopping_enabled, chopping_pch_size,
-            chopping_stride_ratio, chopping_extra_bs,
-            chopping_weight_type,
+            chopping_enabled, tile_size, tile_overlap,
         )
 
         base_name = os.path.splitext(os.path.basename(init_image))[0]
@@ -352,12 +426,12 @@ class FluxInferencer:
 
     def _gen_img2img(self, init_image, scale, switch_t, seed,
                      steps, cfg_scale, shift,
-                     chopping_enabled, chopping_pch_size,
-                     chopping_stride_ratio, chopping_extra_bs,
-                     chopping_weight_type) -> Image.Image:
-        """img2img 核心逻辑。"""
-        src_image = Image.open(init_image).convert("RGB")
+                     chopping_enabled, tile_size, tile_overlap) -> Image.Image:
+        """img2img 核心逻辑：VAE 全局编码 → latent 分 tile 推理 → 高斯融合 → VAE 全局解码。"""
+        AE_FACTOR = 8
+        PATCH_SIZE = 2  # LightningDiT patch size
 
+        src_image = Image.open(init_image).convert("RGB")
         exact_w = int(src_image.size[0] * scale)
         exact_h = int(src_image.size[1] * scale)
 
@@ -377,38 +451,37 @@ class FluxInferencer:
             im_cond = F.pad(im_cond, (0, pad_w, 0, pad_h), mode='reflect')
             self.print(f"Align pad: +({pad_w},{pad_h}) → {im_cond.shape[-1]}x{im_cond.shape[-2]}")
 
-        idle_pch_size = chopping_pch_size
+        # ---- VAE 全局编码一次 ----
+        image_tensor = im_cond * 2.0 - 1.0
+        z_lr = self.vae_encode_tensor(image_tensor)  # [1, 16, H/8, W/8]
+        lh, lw = z_lr.shape[2], z_lr.shape[3]
 
-        use_chopping = (
-            chopping_enabled
-            and not (ori_h <= idle_pch_size and ori_w <= idle_pch_size)
-        )
+        # ---- latent tile 参数 ----
+        lt_size = max((tile_size // AE_FACTOR // PATCH_SIZE) * PATCH_SIZE, PATCH_SIZE)
+        lt_overlap = max(tile_overlap // AE_FACTOR, lt_size // 8)
+        lt_size = min(lt_size, min(lh, lw))
+        lt_overlap = min(lt_overlap, lt_size - 1)
 
-        if not use_chopping:
-            print(f"📐 img2img 整张推理: {ori_w}x{ori_h}, switch_t={switch_t:.2f}, {steps} steps")
-            res_sr = self.process_patch(
-                im_cond, switch_t, seed, steps, cfg_scale, shift,
+        use_tiling = chopping_enabled and (lh > lt_size or lw > lt_size)
+
+        if not use_tiling:
+            print(f"📐 整张 latent 推理: {ori_w}x{ori_h} (latent {lw}×{lh}), "
+                  f"switch_t={switch_t:.2f}, {steps} steps")
+            z_hr = self.reverse_flow_sampling(
+                z_lr, switch_t=switch_t,
+                steps=steps, guidance=cfg_scale, shift=shift, seed=seed,
             )
         else:
-            stride = int(idle_pch_size * chopping_stride_ratio)
-            print(f"📐 img2img 分块推理: {ori_w}x{ori_h}, pch={idle_pch_size}, stride={stride}")
-
-            im_spliter = ImageSpliterTh(
-                im_cond, pch_size=idle_pch_size, stride=stride, sf=1,
-                extra_bs=chopping_extra_bs, weight_type=chopping_weight_type,
+            print(f"📐 Latent tiling 推理: {ori_w}x{ori_h} (latent {lw}×{lh}), "
+                  f"tile={lt_size}×{lt_size} latent (~{tile_size}px), overlap={lt_overlap}")
+            z_hr = self.reverse_flow_sampling_tiled(
+                z_lr, switch_t=switch_t,
+                steps=steps, guidance=cfg_scale, shift=shift, seed=seed,
+                lt_size=lt_size, lt_overlap=lt_overlap,
             )
 
-            total_patches = len(im_spliter)
-            patch_idx = 0
-            for im_pch, index_infos in im_spliter:
-                patch_idx += len(index_infos)
-                print(f"   🧩 Patch {patch_idx}/{total_patches} ({im_pch.shape[-1]}x{im_pch.shape[-2]})")
-                res_pch = self.process_patch(
-                    im_pch, switch_t, seed, steps, cfg_scale, shift,
-                )
-                im_spliter.update(res_pch, index_infos)
-
-            res_sr = im_spliter.gather()
+        # ---- VAE 全局解码一次 ----
+        res_sr = self.vae_decode_tensor(z_hr)
 
         # ---- crop 回精确目标尺寸 ----
         res_sr = res_sr[:, :, 0:ori_h, 0:ori_w]
@@ -442,16 +515,14 @@ def main(
     shift=SHIFT,
     t5_max_length=T5_MAX_LENGTH,
     chopping_enabled=CHOPPING_ENABLED,
-    chopping_pch_size=CHOPPING_PCH_SIZE,
-    chopping_stride_ratio=CHOPPING_STRIDE_RATIO,
-    chopping_extra_bs=CHOPPING_EXTRA_BS,
-    chopping_weight_type=CHOPPING_WEIGHT_TYPE,
+    tile_size=TILE_SIZE,
+    tile_overlap=TILE_OVERLAP,
     no_flow_embedder=False,
 ):
-    """Flux 两阶段流超分推理。
+    """Flux 两阶段流超分推理 (DiT Embedder + Flux)。
 
-    Phase 1 (t ∈ [switch_t, 1.0]): Embedder only — 纯噪声起点，锚定结构
-    Phase 2 (t ∈ [0, switch_t]):   Flux only   — 质量精修
+    Phase 1 (t ∈ [switch_t, 1.0]): DiT Embedder — 纯噪声起点，LR latent 锚定结构
+    Phase 2 (t ∈ [0, switch_t]):   Flux         — 质量精修
     """
     _steps = steps if steps is not None else INFER_STEPS
     _cfg = cfg if cfg is not None else CFG_SCALE
@@ -469,7 +540,7 @@ def main(
     # Phase 2: Flux + VAE
     inferencer.load(model_name, verbose, denoise_device)
 
-    # Phase 3: Flow Embedder（速度校正模块）
+    # Phase 3: DiT Flow Embedder
     fe_path = FLOW_EMBEDDER_PATH
     if no_flow_embedder or NO_FLOW_EMBEDDER:
         print("⏭️  Flow Embedder disabled (pure Flux reverse-flow).")
@@ -484,10 +555,8 @@ def main(
         prompt, "", _steps, _cfg, seed, out_dir,
         init_image=init_image, scale=scale, switch_t=switch_t, shift=shift,
         chopping_enabled=chopping_enabled,
-        chopping_pch_size=chopping_pch_size,
-        chopping_stride_ratio=chopping_stride_ratio,
-        chopping_extra_bs=chopping_extra_bs,
-        chopping_weight_type=chopping_weight_type,
+        tile_size=tile_size,
+        tile_overlap=tile_overlap,
     )
 
 
