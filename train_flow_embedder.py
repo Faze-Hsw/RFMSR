@@ -40,6 +40,7 @@ from tqdm import tqdm
 from datapipe.train_dataloader import create_train_dataloader
 from flux.util import load_ae
 from models.dit_flow_embedder import create_dit_flow_embedder
+from models.dinov2_encoder import create_dinov2_encoder
 
 
 # =========================================================================
@@ -68,6 +69,7 @@ class FlowEmbedderTrainer:
 
         # ---- 加载模块 ----
         self._load_vae()
+        self._load_dinov2()
         self._build_embedder()
         self._build_optimizer()
         self._build_dataloader()
@@ -104,6 +106,17 @@ class FlowEmbedderTrainer:
         self.ae.eval()
         self.ae.requires_grad_(False)
         print("✅ VAE loaded.")
+
+    def _load_dinov2(self):
+        """加载冻结的 DINOv2 语义编码器。"""
+        dv2_cfg = self.cfg.get("dinov2", {}) or {}
+        self.use_dinov2 = dv2_cfg.get("enabled", False)
+
+        if self.use_dinov2:
+            model_cfg_path = self.cfg["model_config"]
+            self.venc = create_dinov2_encoder(model_cfg_path, device=self.device)
+        else:
+            self.venc = None
 
     def _build_embedder(self):
         cfg_path = self.cfg["model_config"]
@@ -155,8 +168,9 @@ class FlowEmbedderTrainer:
         print(f"LR              : {tcfg['lr']}")
         print(f"GT size         : {self.cfg['data']['gt_size']}")
         print(f"Flow            : Noise→HR (HR@t=0, Noise@t=1)")
-        print(f"Architecture    : LightningDiT (VOSR-style, ~0.35B)")
-        print(f"Conditioning    : LR latent (VAE-encoded upsampled LR)")
+        print(f"Architecture    : LightningDiT")
+        print(f"Conditioning    : LR latent (VAE-encoded upsampled LR)" + 
+              (" + DINOv2 Cross-Attn" if self.use_dinov2 else ""))
         print(f"AMP             : {self.use_amp}")
         print("=" * 60 + "\n")
 
@@ -192,7 +206,12 @@ class FlowEmbedderTrainer:
         z_lr = z_lr.detach().float()
         B, C, H, W = z_hr.shape
 
-        # 2. 噪声→HR 去噪流: x_t = (1-t)·z_hr + t·ε
+        # 2. DINOv2 语义特征（从像素空间 LR 提取）
+        venc_fea = None
+        if self.use_dinov2 and self.venc is not None:
+            venc_fea = self.venc(lr)  # list of [B, N, enc_dim]
+
+        # 3. 噪声→HR 去噪流: x_t = (1-t)·z_hr + t·ε
         t = torch.rand(B, device=device)  # [B] ∈ [0,1]
         t_expand = t[:, None, None, None]
         epsilon = torch.randn_like(z_hr)   # [B, 16, H, W]  纯高斯噪声
@@ -201,9 +220,9 @@ class FlowEmbedderTrainer:
         # 真值速度: 从噪声推往 HR
         v_gt = epsilon - z_hr  # [B, 16, H, W]
 
-        # 3. DiT Embedder + Loss (LR latent 条件)
+        # 4. DiT Embedder + Loss (LR latent 条件 + DINOv2 语义)
         with autocast(device_type="cuda", enabled=self.use_amp):
-            v_super = self.embedder(x_t, t, z_lr)
+            v_super = self.embedder(x_t, t, z_lr, venc_fea=venc_fea)
             loss = F.mse_loss(v_super, v_gt)
 
         losses = {"velo": loss.item()}

@@ -18,6 +18,10 @@ flux:
   model_name: flux-dev
   denoise_device: cuda
 
+# ---- DINOv2（冻结，提取 LR 语义特征注入 DiT Cross-Attention） ----
+dinov2:
+  enabled: true
+
 # ---- 训练 ----
 training:
   iterations: 500000

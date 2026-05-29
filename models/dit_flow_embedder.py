@@ -40,8 +40,13 @@ class DiTFlowEmbedder(nn.Module):
         use_rmsnorm: bool = True,
         wo_shift: bool = False,
         use_checkpoint: bool = False,
+        z_dims: int | None = None,
+        num_fused_layers: int = 1,
+        encdim_ratio: int = 2,
     ):
         super().__init__()
+
+        self.z_dims = z_dims
 
         self.dit = LightningDiT(
             input_size=input_size,
@@ -58,22 +63,26 @@ class DiTFlowEmbedder(nn.Module):
             use_rmsnorm=use_rmsnorm,
             wo_shift=wo_shift,
             use_checkpoint=use_checkpoint,
-            z_dims=None,                # 关闭 DinoV2 cross-attention
+            z_dims=z_dims,
+            num_fused_layers=num_fused_layers,
+            encdim_ratio=encdim_ratio,
             auxiliary_time_cond=False,
         )
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, z_lr: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, z_lr: torch.Tensor,
+                venc_fea=None) -> torch.Tensor:
         """
         Args:
             x_t:  [B, 16, H, W]  当前流状态
             t:    [B]             时间
-            z_lr: [B, 16, H, W]  LR latent（支持任意分辨率，动态 RoPE）
+            z_lr: [B, 16, H, W]  LR latent（channel-concat 条件）
+            venc_fea: DINOv2 特征列表 [tensor[B,N,C]] 或 None（Cross-Attn 条件）
 
         Returns:
             v:    [B, 16, H, W]  速度预测
         """
         inp = torch.cat([z_lr, x_t], dim=1)  # [B, 32, H, W]
-        return self.dit.forward_flexible(inp, t)
+        return self.dit.forward_flexible(inp, t, z=venc_fea)
 
 
 def create_dit_flow_embedder(cfg_path: str) -> DiTFlowEmbedder:
@@ -82,6 +91,12 @@ def create_dit_flow_embedder(cfg_path: str) -> DiTFlowEmbedder:
         cfg = yaml.safe_load(f)
 
     arch = cfg.get("dit_arch", {})
+    dv2 = cfg.get("dinov2", {}) or {}
+
+    z_dims = dv2.get("enc_dim", None)
+    num_fused_layers = len(dv2.get("layer_dinov2b_list", [1]))
+    encdim_ratio = dv2.get("encdim_ratio", 2)
+
     return DiTFlowEmbedder(
         input_size=arch.get("input_size", 64),
         patch_size=arch.get("patch_size", 2),
@@ -97,4 +112,7 @@ def create_dit_flow_embedder(cfg_path: str) -> DiTFlowEmbedder:
         use_rmsnorm=arch.get("use_rmsnorm", True),
         wo_shift=arch.get("wo_shift", False),
         use_checkpoint=arch.get("use_checkpoint", False),
+        z_dims=z_dims,
+        num_fused_layers=num_fused_layers,
+        encdim_ratio=encdim_ratio,
     )

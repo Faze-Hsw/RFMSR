@@ -16,4 +16,12 @@ dit_arch:
   use_rope: true              # RoPE 位置编码
   use_rmsnorm: true           # RMSNorm（非 LayerNorm）
   wo_shift: false             # AdaLN 是否包含 shift
-  use_checkpoint: false       # 梯度检查点（省显存）
+  use_checkpoint: true       # 梯度检查点（省显存）
+
+# DINOv2 语义条件注入（Cross-Attention）
+dinov2:
+  enc_type: dinov2b           # dinov2b (ViT-B/14) / dinov2l (ViT-L/14) / dinov2g (ViT-G/14)
+  enc_dim: 768                # DINOv2 特征维度 (dinov2b=768, dinov2l=1024, dinov2g=1536)
+  dinov2_size: 448            # 输入 resize 尺寸
+  layer_dinov2b_list: [8]     # 注入哪一层 DINOv2 特征 (0-based, ViT-B共12层, ViT-L共24层)
+  encdim_ratio: 2             # mlp_ca 扩展比

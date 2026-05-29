@@ -24,6 +24,7 @@ from tqdm import tqdm
 from safetensors.torch import load_file as safe_load
 from flux.util import load_flow_model, load_t5, load_clip, load_ae
 from models.dit_flow_embedder import create_dit_flow_embedder
+from models.dinov2_encoder import create_dinov2_encoder
 
 
 #################################################################################################
@@ -110,7 +111,7 @@ class FluxInferencer:
         print("✅ Models loaded.")
 
     def load_flow_embedder(self, ckpt_path: str, config_path: str = None):
-        """加载训练好的 DiT Flow Embedder。"""
+        """加载训练好的 DiT Flow Embedder + DINOv2 编码器。"""
         if config_path is None:
             config_path = os.path.join(_SCRIPT_DIR, "configs", "flow_embedder.yaml")
         print(f"Loading DiT FlowEmbedder from {ckpt_path} ...")
@@ -122,6 +123,12 @@ class FluxInferencer:
         self.flow_embedder.eval()
         n = sum(p.numel() for p in self.flow_embedder.parameters()) / 1e6
         print(f"  Params: {n:.2f}M")
+
+        # DINOv2 编码器
+        self.venc = create_dinov2_encoder(config_path, device=self.denoise_device)
+        if self.venc is not None:
+            print(f"  DINOv2: loaded ({self.venc.encoder.__class__.__name__})")
+
         print("✅ DiT FlowEmbedder loaded.")
 
     def load_text_encoders(self, device="cuda", t5_max_length=T5_MAX_LENGTH,
@@ -160,11 +167,12 @@ class FluxInferencer:
     def reverse_flow_sampling(self, z_lr: torch.Tensor,
                                switch_t: float = 0.5,
                                steps: int = 28, guidance: float = 3.5,
-                               shift: bool = True, seed: int = 42) -> torch.Tensor:
+                               shift: bool = True, seed: int = 42,
+                               venc_fea=None) -> torch.Tensor:
         """
         两阶段逆流积分: t=1(纯噪声) → t=0(HR)
 
-        Phase 1 (t ∈ [switch_t, 1.0]): DiT Embedder — 纯噪声→锚定结构 (LR latent 条件)
+        Phase 1 (t ∈ [switch_t, 1.0]): DiT Embedder — 纯噪声→锚定结构 (LR latent 条件 + DINOv2)
         Phase 2 (t ∈ [0, switch_t]):   Flux         — 质量精修
         """
         device = z_lr.device
@@ -198,9 +206,9 @@ class FluxInferencer:
                 dt = t_prev - t_curr
 
                 if t_curr > switch_t:
-                    # Phase 1: DiT Embedder — LR latent 条件
+                    # Phase 1: DiT Embedder — LR latent + DINOv2 语义条件
                     if hasattr(self, 'flow_embedder'):
-                        v_total = self.flow_embedder(x, t_batch, z_lr).float()
+                        v_total = self.flow_embedder(x, t_batch, z_lr, venc_fea=venc_fea).float()
                     else:
                         v_total = torch.zeros(B, C, H, W, device=device)
                     n_embed += 1
@@ -311,6 +319,7 @@ class FluxInferencer:
         switch_t: float = 0.5, steps: int = 28, guidance: float = 3.5,
         shift: bool = True, seed: int = 42,
         lt_size: int = 64, lt_overlap: int = 8,
+        venc_fea=None,
     ) -> torch.Tensor:
         """Latent 空间分 tile 的两阶段逆流积分（VOSR 风格）。"""
         device = z_lr.device
@@ -369,9 +378,9 @@ class FluxInferencer:
 
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         if is_embedder_step:
-                            # Phase 1: DiT Embedder
+                            # Phase 1: DiT Embedder (DINOv2 仅全图模式, tile 传 None)
                             if hasattr(self, 'flow_embedder'):
-                                v_tile = self.flow_embedder(x_tile, t_batch, z_lr_tile).float()
+                                v_tile = self.flow_embedder(x_tile, t_batch, z_lr_tile, venc_fea=venc_fea).float()
                             else:
                                 v_tile = torch.zeros_like(x_tile)
                         else:
@@ -456,6 +465,13 @@ class FluxInferencer:
         z_lr = self.vae_encode_tensor(image_tensor)  # [1, 16, H/8, W/8]
         lh, lw = z_lr.shape[2], z_lr.shape[3]
 
+        # ---- DINOv2 语义特征（从像素空间 LR 提取） ----
+        venc_fea = None
+        if hasattr(self, 'venc') and self.venc is not None:
+            lr_pixel = (im_cond + 1.0) / 2.0   # [-1,1] bf16 → [0,1] float
+            lr_pixel = lr_pixel.float()
+            venc_fea = self.venc(lr_pixel)
+
         # ---- latent tile 参数 ----
         lt_size = max((tile_size // AE_FACTOR // PATCH_SIZE) * PATCH_SIZE, PATCH_SIZE)
         lt_overlap = max(tile_overlap // AE_FACTOR, lt_size // 8)
@@ -470,6 +486,7 @@ class FluxInferencer:
             z_hr = self.reverse_flow_sampling(
                 z_lr, switch_t=switch_t,
                 steps=steps, guidance=cfg_scale, shift=shift, seed=seed,
+                venc_fea=venc_fea,
             )
         else:
             print(f"📐 Latent tiling 推理: {ori_w}x{ori_h} (latent {lw}×{lh}), "
@@ -478,6 +495,7 @@ class FluxInferencer:
                 z_lr, switch_t=switch_t,
                 steps=steps, guidance=cfg_scale, shift=shift, seed=seed,
                 lt_size=lt_size, lt_overlap=lt_overlap,
+                venc_fea=venc_fea,
             )
 
         # ---- VAE 全局解码一次 ----
