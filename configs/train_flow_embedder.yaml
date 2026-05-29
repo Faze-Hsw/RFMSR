@@ -8,7 +8,7 @@ data:
   hr_dir: traindata/
   degradation_config: configs/realesrgan_degradation.yaml
   gt_size: 512
-  batch_size: 16
+  batch_size: 32
   num_workers: 12
   use_hflip: true
   use_rot: false
@@ -31,6 +31,10 @@ training:
   use_amp: true
   ema_rate: 0.999
   seed: 42
+
+# ---- Residual Flow Matching ----
+flow:
+  sigma: 1.0          # 噪声标准差
 
 # ---- 日志 & 保存 ----
 experiment:

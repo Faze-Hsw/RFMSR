@@ -1,12 +1,13 @@
 """
 DINOv2 编码器 — 冻结，从 LR 图片提取语义特征注入 DiT Cross-Attention。
 
+使用 HuggingFace transformers 自动下载权重：
+  export HF_ENDPOINT=https://hf-mirror.com   # AutoDL 等国内服务器
+
 用法:
-    encoder = load_dinov2_encoder("dinov2b", device="cuda")
+    encoder = create_dinov2_encoder("configs/flow_embedder.yaml", device="cuda")
     features = encoder(lr_tensor)  # lr: [B,3,H,W] float [0,1] → list[[B,N,enc_dim]]
 """
-
-import types
 
 import torch
 import torch.nn as nn
@@ -15,6 +16,12 @@ from torchvision.transforms import Normalize
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+DINOV2_HF_MODELS = {
+    "dinov2b": "facebook/dinov2-base",
+    "dinov2l": "facebook/dinov2-large",
+    "dinov2g": "facebook/dinov2-giant",
+}
 
 
 class Dinov2Encoder(nn.Module):
@@ -32,42 +39,33 @@ class Dinov2Encoder(nn.Module):
         self.dinov2_size = dinov2_size
         self.layer_indices = layer_indices or [8]
 
-        # 加载 DINOv2
-        print(f"Loading DINOv2 encoder ({enc_type}) ...")
-        encoder = torch.hub.load("facebookresearch/dinov2", f"dinov2_vit{enc_type[-1]}14")
+        model_name = DINOV2_HF_MODELS.get(enc_type)
+        if model_name is None:
+            raise ValueError(
+                f"Unknown DINOv2 type: {enc_type}, "
+                f"expected one of {list(DINOV2_HF_MODELS)}"
+            )
 
-        # 去掉分类头，添加 forward_with_features
-        del encoder.head
-        encoder.head = nn.Identity()
+        print(f"Loading DINOv2 from HuggingFace: {model_name} ...")
+        try:
+            from transformers import AutoModel
+            self.encoder = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load DINOv2 from HuggingFace: {e}\n"
+                f"设置镜像重试: export HF_ENDPOINT=https://hf-mirror.com"
+            )
 
-        self._patch_forward_with_features(encoder, self.layer_indices)
-        self.encoder = encoder.to(device).eval()
+        self.encoder = self.encoder.to(device).eval()
         for p in self.encoder.parameters():
             p.requires_grad_(False)
 
         print(f"✅ DINOv2 encoder loaded, layers={self.layer_indices}")
 
-    @staticmethod
-    def _patch_forward_with_features(encoder, layer_indices):
-        """给 DINOv2 ViT 打 monkey-patch，使其 forward 返回中间层特征。"""
-        def forward_with_features(self, x, masks=None):
-            features = {}
-            if isinstance(x, list):
-                return self.forward_features_list(x, masks)
-            x = self.prepare_tokens_with_masks(x, masks)
-            for i, blk in enumerate(self.blocks):
-                x = blk(x)
-                if i in layer_indices:
-                    features[f"layer_{i}"] = x[:, 1:]  # 去 CLS token
-            x_norm = self.norm(x)
-            return features, x_norm[:, 1:]
-
-        encoder.forward_with_features = types.MethodType(forward_with_features, encoder)
-
     def preprocess(self, lr: torch.Tensor) -> torch.Tensor:
         """
         lr: [B, 3, H, W] float [0, 1]
-        → resize 448, ImageNet 标准化 → [B, 3, 448, 448]
+        → resize → clamp → ImageNet 标准化
         """
         x = F.interpolate(lr, size=self.dinov2_size, mode="bicubic", align_corners=False)
         x = x.clamp(0, 1)
@@ -78,14 +76,26 @@ class Dinov2Encoder(nn.Module):
     def forward(self, lr: torch.Tensor) -> list[torch.Tensor]:
         """
         lr: [B, 3, H, W] float [0, 1]
-        → list of [B, N_patches, enc_dim]  每个 tensor 对应一个指定层
+        → list of [B, N_patches, enc_dim]  每个 tensor 对应 layer_indices 中的一个指定层
         """
         x = self.preprocess(lr)
-        features, x_norm = self.encoder.forward_with_features(x)
 
-        z_list = [features[f"layer_{i}"] for i in self.layer_indices]
-        # 最后一层用 x_norm 替换
-        z_list[-1] = x_norm
+        outputs = self.encoder(
+            pixel_values=x,
+            output_hidden_states=True,
+            interpolate_pos_encoding=True,
+        )
+
+        # hidden_states: (embedding, block_0, block_1, ..., block_L)
+        # hs[0] = patch_embed + pos_embed, hs[i] = block i-1 的输出
+        hidden_states = outputs.hidden_states
+
+        z_list = []
+        for idx in self.layer_indices:
+            z_list.append(hidden_states[idx + 1][:, 1:, :])  # +1 跳过 embedding 层，去 CLS token
+
+        # 最后一层用最终 hidden state
+        z_list[-1] = hidden_states[-1][:, 1:, :]
 
         return z_list
 

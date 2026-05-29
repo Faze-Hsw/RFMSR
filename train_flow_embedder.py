@@ -1,21 +1,17 @@
 """
 Flow Embedder 训练脚本 — LightningDiT 速度预测
 
-训练目标: DiT Embedder 学习从噪声到 HR 的流匹配速度，以 LR latent 为条件。
+训练目标: DiT Embedder 学习 Residual Flow Matching — 从 LR→HR 的残差流。
 
-流路径: t=0 → HR latent, t=1 → 纯高斯噪声 ε
-  x_t = (1-t)·z_hr + t·ε
-  v_gt = ε - z_hr
+Residual Flow 路径: t=0 → HR latent, t=1 → z_lr + σ·ε
+  x_t = z_hr + t·(z_lr - z_hr) + t·σ·ε
+  v_gt = (z_lr - z_hr) + σ·ε
 
-架构 (VOSR LightningDiT, ~0.35B):
+架构 (LightningDiT, ~0.35B):
   cat(z_lr[16ch], x_t[16ch]) → [B, 32, H, W]
     → PatchEmbed(patch=2) → tokens
-    → 28× LightningDiTBlock (Self-Attn + RoPE + QKNorm + SwiGLU + AdaLN)
+    → 28× LightningDiTBlock (Self-Attn + Cross-Attn(DINOv2) + SwiGLU + AdaLN)
     → unpatchify → v [16ch]
-
-训推一致:
-  Phase 1 (高噪声): DiT Embedder 从纯噪声锚定结构
-  Phase 2 (低噪声): Flux 精修质量
 
 用法:
   python train_flow_embedder.py
@@ -23,6 +19,7 @@ Flow Embedder 训练脚本 — LightningDiT 速度预测
 
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HOME"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 import argparse
 import random
 from collections import OrderedDict
@@ -57,6 +54,10 @@ class FlowEmbedderTrainer:
 
         self.device = torch.device(self.cfg["flux"]["denoise_device"])
         self._setup_seed(self.cfg["training"]["seed"])
+
+        # Residual Flow Matching
+        flow_cfg = self.cfg.get("flow", {})
+        self.sigma = flow_cfg.get("sigma", 1.0)
 
         # ---- 实验目录 ----
         exp = self.cfg["experiment"]
@@ -122,7 +123,7 @@ class FlowEmbedderTrainer:
         cfg_path = self.cfg["model_config"]
         self.embedder = create_dit_flow_embedder(cfg_path).to(self.device)
         n_params = sum(p.numel() for p in self.embedder.parameters())
-        print(f"✅ LightningDiT Embedder: {n_params / 1e6:.1f}M (~0.35B) params")
+        print(f"✅ LightningDiT Embedder: {n_params / 1e6:.1f}M params")
 
     def _build_optimizer(self):
         tcfg = self.cfg["training"]
@@ -167,7 +168,7 @@ class FlowEmbedderTrainer:
         print(f"Batch size      : {self.cfg['data']['batch_size']}")
         print(f"LR              : {tcfg['lr']}")
         print(f"GT size         : {self.cfg['data']['gt_size']}")
-        print(f"Flow            : Noise→HR (HR@t=0, Noise@t=1)")
+        print(f"Flow            : Residual FM (LR→HR), σ={self.sigma}")
         print(f"Architecture    : LightningDiT")
         print(f"Conditioning    : LR latent (VAE-encoded upsampled LR)" + 
               (" + DINOv2 Cross-Attn" if self.use_dinov2 else ""))
@@ -190,60 +191,54 @@ class FlowEmbedderTrainer:
     # ------------------------------------------------------------------
 
     def train_step(self, batch: dict) -> dict:
-        tcfg = self.cfg["training"]
         device = self.device
 
         hr = batch["gt"].to(device)      # [B, 3, H, W]  [0, 1]
         lr = batch["lq"].to(device)      # [B, 3, H, W]  [0, 1]
-        bs = hr.shape[0]
 
         # 1. VAE encode
         z_hr = self.vae_encode(hr)       # [B, 16, H/8, W/8]
         lr_up = F.interpolate(lr, size=hr.shape[-2:], mode="bicubic", align_corners=False)
-        z_lr = self.vae_encode(lr_up)    # [B, 16, H/8, W/8]  ← LR latent 条件
+        z_lr = self.vae_encode(lr_up)    # [B, 16, H/8, W/8]
 
         z_hr = z_hr.detach().float()
         z_lr = z_lr.detach().float()
-        B, C, H, W = z_hr.shape
+        B = z_hr.shape[0]
 
         # 2. DINOv2 语义特征（从像素空间 LR 提取）
         venc_fea = None
         if self.use_dinov2 and self.venc is not None:
-            venc_fea = self.venc(lr)  # list of [B, N, enc_dim]
+            venc_fea = self.venc(lr)
 
-        # 3. 噪声→HR 去噪流: x_t = (1-t)·z_hr + t·ε
-        t = torch.rand(B, device=device)  # [B] ∈ [0,1]
+        # 3. Residual Flow: x_t = z_hr + t·(z_lr - z_hr) + t·σ·ε
+        t = torch.rand(B, device=device)
         t_expand = t[:, None, None, None]
-        epsilon = torch.randn_like(z_hr)   # [B, 16, H, W]  纯高斯噪声
-        x_t = (1.0 - t_expand) * z_hr + t_expand * epsilon  # [B, 16, H, W]
+        epsilon = torch.randn_like(z_hr)
+        residual = z_lr - z_hr
+        x_t = z_hr + t_expand * residual + t_expand * self.sigma * epsilon
+        v_gt = residual + self.sigma * epsilon
 
-        # 真值速度: 从噪声推往 HR
-        v_gt = epsilon - z_hr  # [B, 16, H, W]
-
-        # 4. DiT Embedder + Loss (LR latent 条件 + DINOv2 语义)
+        # 4. DiT Embedder + Loss
         with autocast(device_type="cuda", enabled=self.use_amp):
             v_super = self.embedder(x_t, t, z_lr, venc_fea=venc_fea)
             loss = F.mse_loss(v_super, v_gt)
 
         losses = {"velo": loss.item()}
 
-        # 4. 反向传播
+        # 5. 反向传播
+        grad_clip = self.cfg["training"]["gradient_clip"]
         self.optimizer.zero_grad()
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
-            if tcfg["gradient_clip"] > 0:
+            if grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.embedder.parameters(), tcfg["gradient_clip"]
-                )
+                torch.nn.utils.clip_grad_norm_(self.embedder.parameters(), grad_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
             loss.backward()
-            if tcfg["gradient_clip"] > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.embedder.parameters(), tcfg["gradient_clip"]
-                )
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.embedder.parameters(), grad_clip)
             self.optimizer.step()
 
         # EMA 更新

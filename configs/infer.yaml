@@ -2,7 +2,7 @@
 # 参数优先级: CLI 参数 > 此配置文件 > 内置默认值
 #
 # 两阶段逆流积分:
-#   Phase 1 (t ∈ [switch_t, 1.0]): Embedder only — 纯噪声起点，锚定结构
+#   Phase 1 (t ∈ [switch_t, 1.0]): Embedder only — Residual FM，z_lr+noise 起点还原细节
 #   Phase 2 (t ∈ [0, switch_t]):   Flux only   — 提升质量
 
 # 模型名称: flux-dev, flux-schnell 等
@@ -50,3 +50,4 @@ chopping:
 # DiT Flow Embedder (LightningDiT)
 flow_embedder_path: checkpoints/flow_embedder.safetensors
 no_flow_embedder: false
+flow_sigma: 1.0           # Residual FM 噪声标准差 (latent 空间)
