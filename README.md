@@ -117,10 +117,10 @@ python infer.py --init_image large_image.jpg --scale 1.0 ^
 
 ### 使用自定义配置文件
 
-修改 `configs/infer.yaml` 设置默认参数，然后：
+修改 `configs/infer_flux.yaml` 设置默认参数，然后：
 
 ```bash
-python infer.py --config configs/infer.yaml --init_image input.png
+python infer_flux.py --config configs/infer_flux.yaml --init_image input.png
 ```
 
 ### 模型变体选择

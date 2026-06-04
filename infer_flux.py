@@ -1,12 +1,12 @@
 """
-Flux 超分推理脚本 — DiT Embedder 两阶段 Residual Flow 版本
+Flux 超分推理脚本 — ResFlow 两阶段 Residual Flow 版本
 
 两阶段逆流积分:
-  Phase 1 (t=1 → switch_t): DiT Embedder — Residual FM, z_lr+noise 起点还原细节
-  Phase 2 (switch_t → t=0): Flux         — 质量精修，去伪影、加细节
+  Phase 1 (t=1 → switch_t): ResFlow — Residual FM, z_lr+noise 起点还原细节
+  Phase 2 (switch_t → t=0): Flux    — 质量精修，去伪影、加细节
 
 用法:
-  python infer.py --init_image input.png --scale 2.0 --switch_t 0.5
+  python infer_flux.py --init_image input.png --scale 2.0 --switch_t 0.5
 """
 
 import os
@@ -14,6 +14,7 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HF_HOME"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 import math
 import fire
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -24,8 +25,9 @@ from tqdm import tqdm
 
 from safetensors.torch import load_file as safe_load
 from flux.util import load_flow_model, load_t5, load_clip, load_ae
-from models.dit_flow_embedder import create_dit_flow_embedder
+from models.resflow import create_resflow
 from models.dinov2_encoder import create_dinov2_encoder
+from utils.color_fix import apply_color_fix
 
 
 #################################################################################################
@@ -33,7 +35,7 @@ from models.dinov2_encoder import create_dinov2_encoder
 #################################################################################################
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "infer.yaml")
+_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "infer_flux.yaml")
 
 
 def load_config() -> dict:
@@ -65,10 +67,10 @@ DENOISE_DEVICE = _CFG.get("denoise_device", "cuda")
 _CHOPPING_CFG = _CFG.get("chopping", {})
 CHOPPING_ENABLED = _CHOPPING_CFG.get("enabled", False)
 TILE_SIZE = _CHOPPING_CFG.get("tile_size", 512)          # pixel-space tile size
-TILE_OVERLAP = _CHOPPING_CFG.get("tile_overlap", 4)      # pixel-space overlap
+TILE_STRIDE = _CHOPPING_CFG.get("tile_stride", 256)       # pixel-space stride
 
-FLOW_EMBEDDER_PATH = _CFG.get("flow_embedder_path", None)
-NO_FLOW_EMBEDDER = _CFG.get("no_flow_embedder", False)
+RESFLOW_PATH = _CFG.get("resflow_path", None)
+NO_RESFLOW = _CFG.get("no_resflow", False)
 FLOW_SIGMA = _CFG.get("flow_sigma", 1.0)
 T5_MAX_LENGTH = _CFG.get("t5_max_length", 512)
 
@@ -79,6 +81,8 @@ INFER_STEPS = _CFG.get("infer_steps", 28)
 # t ∈ (switch_t, 1.0] → DiT Embedder (Residual FM)
 # t ∈ [0, switch_t]   → Flux 质量精修
 SWITCH_T = _CFG.get("switch_t", 0.5)
+
+COLOR_CORRECTION = _CFG.get("color_correction", "none")
 
 
 #################################################################################################
@@ -111,18 +115,19 @@ class FluxInferencer:
 
         print("✅ Models loaded.")
 
-    def load_flow_embedder(self, ckpt_path: str, config_path: str = None):
-        """加载训练好的 DiT Flow Embedder + DINOv2 编码器。"""
+    def load_resflow(self, ckpt_path: str, config_path: str = None):
+        """加载训练好的 ResFlow + DINOv2 编码器。"""
         if config_path is None:
-            config_path = os.path.join(_SCRIPT_DIR, "configs", "flow_embedder.yaml")
-        print(f"Loading DiT FlowEmbedder from {ckpt_path} ...")
+            config_path = os.path.join(_SCRIPT_DIR, "configs", "resflow.yaml")
+        print(f"Loading ResFlow from {ckpt_path} ...")
 
-        self.flow_embedder = create_dit_flow_embedder(config_path)
+        self.resflow = create_resflow(config_path)
         sd = safe_load(ckpt_path)
-        self.flow_embedder.load_state_dict(sd, strict=True)
-        self.flow_embedder = self.flow_embedder.to(self.denoise_device, dtype=torch.float32)
-        self.flow_embedder.eval()
-        n = sum(p.numel() for p in self.flow_embedder.parameters()) / 1e6
+        self.resflow.load_state_dict(sd, strict=True)
+        self.resflow = self.resflow.to(self.denoise_device, dtype=torch.float32)
+        self.resflow.eval()
+        self.resflow.dit.use_checkpoint = False  
+        n = sum(p.numel() for p in self.resflow.parameters()) / 1e6
         print(f"  Params: {n:.2f}M")
 
         # DINOv2 编码器
@@ -130,7 +135,7 @@ class FluxInferencer:
         if self.venc is not None:
             print(f"  DINOv2: loaded ({self.venc.encoder.__class__.__name__})")
 
-        print("✅ DiT FlowEmbedder loaded.")
+        print("✅ ResFlow loaded.")
 
     def load_text_encoders(self, device="cuda", t5_max_length=T5_MAX_LENGTH,
                            t5xxl_path=None, clip_path=None):
@@ -173,8 +178,8 @@ class FluxInferencer:
         """
         两阶段逆流积分: t=1(LR+noise) → t=0(HR)
 
-        Phase 1 (t ∈ [switch_t, 1.0]): DiT Embedder — Residual FM，从 LR 还原细节
-        Phase 2 (t ∈ [0, switch_t]):   Flux         — 质量精修
+        Phase 1 (t ∈ [switch_t, 1.0]): ResFlow — Residual FM，从 LR 还原细节
+        Phase 2 (t ∈ [0, switch_t]):   Flux    — 质量精修
         """
         device = z_lr.device
         B, C, H, W = z_lr.shape
@@ -213,8 +218,8 @@ class FluxInferencer:
 
                 if t_curr > switch_t:
                     # Phase 1: DiT Embedder — LR latent + DINOv2 语义条件
-                    if hasattr(self, 'flow_embedder'):
-                        v_total = self.flow_embedder(x, t_batch, z_lr, venc_fea=venc_fea).float()
+                    if hasattr(self, 'resflow'):
+                        v_total = self.resflow(x, t_batch, z_lr, venc_fea=venc_fea).float()
                     else:
                         v_total = torch.zeros(B, C, H, W, device=device)
                     n_embed += 1
@@ -293,9 +298,8 @@ class FluxInferencer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _make_tile_grid(length: int, tile: int, overlap: int):
-        """返回覆盖整个维度的 (start, end) tile 位置列表。每个 tile 大小 = tile。"""
-        stride = max(tile - overlap, 1)
+    def _make_tile_grid(length: int, tile: int, stride: int):
+        """返回覆盖整个维度的 (start, end) tile 位置列表。"""
         if length <= tile:
             return [(0, length)]
         positions = list(range(0, length - tile + 1, stride))
@@ -305,15 +309,21 @@ class FluxInferencer:
 
     @staticmethod
     def _gaussian_weights(tile_h: int, tile_w: int, channels: int, device: torch.device):
-        """2D 高斯融合权重，中心最高、边缘衰减。"""
-        var = 0.01
-        mid_h, mid_w = (tile_h - 1) / 2, (tile_w - 1) / 2
-        y = torch.arange(tile_h, dtype=torch.float32, device=device)
-        x = torch.arange(tile_w, dtype=torch.float32, device=device)
-        wy = torch.exp(-((y - mid_h) / tile_h) ** 2 / (2 * var))
-        wx = torch.exp(-((x - mid_w) / tile_w) ** 2 / (2 * var))
-        w = wy[:, None] * wx[None, :]
-        return w.unsqueeze(0).unsqueeze(0).expand(1, channels, -1, -1)
+        """2D 高斯融合权重，OpenCV 自适应 sigma。"""
+        def _kernel_1d(ksize):
+            sigma = 0.3 * ((ksize - 1) * 0.5 - 1) + 0.8
+            if ksize % 2 == 0:
+                kernel = cv2.getGaussianKernel(ksize=ksize + 1, sigma=sigma, ktype=cv2.CV_64F)
+                kernel = kernel[1:, ]
+            else:
+                kernel = cv2.getGaussianKernel(ksize=ksize, sigma=sigma, ktype=cv2.CV_64F)
+            return kernel
+
+        kernel_h = _kernel_1d(tile_h)       # (H, 1)
+        kernel_w = _kernel_1d(tile_w)       # (W, 1)
+        w = np.matmul(kernel_h, kernel_w.T) # (H, W)
+        w = torch.from_numpy(w).float().unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        return w.to(device).expand(1, channels, -1, -1)
 
     # ------------------------------------------------------------------
     # Tiled reverse flow sampling
@@ -324,7 +334,7 @@ class FluxInferencer:
         self, z_lr: torch.Tensor,
         switch_t: float = 0.5, steps: int = 28, guidance: float = 3.5,
         shift: bool = True, seed: int = 42,
-        lt_size: int = 64, lt_overlap: int = 8,
+        lt_size: int = 64, lt_stride: int = 32,
         lr_pixel=None,
     ) -> torch.Tensor:
         """Latent 空间分 tile 的两阶段逆流积分（VOSR 风格：每 tile 独立 DINOv2）。"""
@@ -346,10 +356,10 @@ class FluxInferencer:
                    f"{', shift' if shift else ''}, switch_t={switch_t:.3f}, σ={FLOW_SIGMA}")
 
         # ---- tile 网格 ----
-        h_tiles = self._make_tile_grid(H, lt_size, lt_overlap)
-        w_tiles = self._make_tile_grid(W, lt_size, lt_overlap)
+        h_tiles = self._make_tile_grid(H, lt_size, lt_stride)
+        w_tiles = self._make_tile_grid(W, lt_size, lt_stride)
         self.print(f"   Tile grid: {len(h_tiles)}×{len(w_tiles)} "
-                   f"({lt_size}×{lt_size} latent, overlap={lt_overlap})")
+                   f"({lt_size}×{lt_size} latent, stride={lt_stride})")
 
         # ---- Per-tile DINOv2 features（预计算一次，VOSR 风格） ----
         AE_FACTOR = 8
@@ -402,8 +412,8 @@ class FluxInferencer:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         if is_embedder_step:
                             # Phase 1: DiT Embedder + 该 tile 独立的 DINOv2 语义条件
-                            if hasattr(self, 'flow_embedder'):
-                                v_tile = self.flow_embedder(x_tile, t_batch, z_lr_tile, venc_fea=tile_fea).float()
+                            if hasattr(self, 'resflow'):
+                                v_tile = self.resflow(x_tile, t_batch, z_lr_tile, venc_fea=tile_fea).float()
                             else:
                                 v_tile = torch.zeros_like(x_tile)
                         else:
@@ -438,7 +448,8 @@ class FluxInferencer:
     def gen_image(self, prompt="", neg_prompt="", steps=None,
                   cfg_scale=CFG_SCALE, seed=SEED, out_dir=OUTDIR,
                   init_image=None, scale=1.0, switch_t=0.5, shift=True,
-                  chopping_enabled=False, tile_size=512, tile_overlap=32):
+                  chopping_enabled=False, tile_size=512, tile_stride=256,
+                  color_correction='none'):
         """img2img 超分/增强。"""
         if init_image is None:
             raise ValueError("必须提供 init_image 参数。")
@@ -447,18 +458,19 @@ class FluxInferencer:
 
         image = self._gen_img2img(
             init_image, scale, switch_t, seed, _steps, cfg_scale, shift,
-            chopping_enabled, tile_size, tile_overlap,
+            chopping_enabled, tile_size, tile_stride, color_correction,
         )
 
         base_name = os.path.splitext(os.path.basename(init_image))[0]
-        save_path = os.path.join(out_dir, f"{base_name}_sr.png")
+        save_path = os.path.join(out_dir, f"{base_name}.png")
         self.print(f"Saving to {save_path}")
         image.save(save_path)
         self.print("Done")
 
     def _gen_img2img(self, init_image, scale, switch_t, seed,
                      steps, cfg_scale, shift,
-                     chopping_enabled, tile_size, tile_overlap) -> Image.Image:
+                     chopping_enabled, tile_size, tile_stride,
+                     color_correction='none') -> Image.Image:
         """img2img 核心逻辑：VAE 全局编码 → latent 分 tile 推理 → 高斯融合 → VAE 全局解码。"""
         AE_FACTOR = 8
         PATCH_SIZE = 2  # LightningDiT patch size
@@ -495,9 +507,9 @@ class FluxInferencer:
 
         # ---- latent tile 参数 ----
         lt_size = max((tile_size // AE_FACTOR // PATCH_SIZE) * PATCH_SIZE, PATCH_SIZE)
-        lt_overlap = max(tile_overlap // AE_FACTOR, lt_size // 8)
+        lt_stride = max((tile_stride // AE_FACTOR // PATCH_SIZE) * PATCH_SIZE, PATCH_SIZE)
         lt_size = min(lt_size, min(lh, lw))
-        lt_overlap = min(lt_overlap, lt_size - 1)
+        lt_stride = min(lt_stride, lt_size)
 
         use_tiling = chopping_enabled and (lh > lt_size or lw > lt_size)
 
@@ -511,11 +523,11 @@ class FluxInferencer:
             )
         else:
             print(f"📐 Latent tiling 推理: {ori_w}x{ori_h} (latent {lw}×{lh}), "
-                  f"tile={lt_size}×{lt_size} latent (~{tile_size}px), overlap={lt_overlap}")
+                  f"tile={lt_size}×{lt_size} latent (~{tile_size}px), stride={lt_stride}")
             z_hr = self.reverse_flow_sampling_tiled(
                 z_lr, switch_t=switch_t,
                 steps=steps, guidance=cfg_scale, shift=shift, seed=seed,
-                lt_size=lt_size, lt_overlap=lt_overlap,
+                lt_size=lt_size, lt_stride=lt_stride,
                 lr_pixel=lr_pixel,
             )
 
@@ -529,7 +541,13 @@ class FluxInferencer:
         image = torch.clamp(res_sr, 0.0, 1.0)[0]
         decoded_np = 255.0 * np.moveaxis(image.cpu().float().numpy(), 0, 2)
         decoded_np = decoded_np.astype(np.uint8)
-        return Image.fromarray(decoded_np)
+        sr_image = Image.fromarray(decoded_np)
+
+        # ---- 颜色校正 ----
+        if color_correction != 'none':
+            sr_image = apply_color_fix(sr_image, target_image, method=color_correction)
+
+        return sr_image
 
 
 #################################################################################################
@@ -555,13 +573,14 @@ def main(
     t5_max_length=T5_MAX_LENGTH,
     chopping_enabled=CHOPPING_ENABLED,
     tile_size=TILE_SIZE,
-    tile_overlap=TILE_OVERLAP,
-    no_flow_embedder=False,
+    tile_stride=TILE_STRIDE,
+    no_resflow=False,
+    color_correction=COLOR_CORRECTION,
 ):
-    """Flux 两阶段 Residual Flow 超分推理 (DiT Embedder + Flux)。
+    """Flux 两阶段 Residual Flow 超分推理 (ResFlow + Flux)。
 
-    Phase 1 (t ∈ [switch_t, 1.0]): DiT Embedder — z_lr+noise 起点，Residual FM
-    Phase 2 (t ∈ [0, switch_t]):   Flux         — 质量精修
+    Phase 1 (t ∈ [switch_t, 1.0]): ResFlow — z_lr+noise 起点，Residual FM
+    Phase 2 (t ∈ [0, switch_t]):   Flux    — 质量精修
     """
     _steps = steps if steps is not None else INFER_STEPS
     _cfg = cfg if cfg is not None else CFG_SCALE
@@ -579,14 +598,14 @@ def main(
     # Phase 2: Flux + VAE
     inferencer.load(model_name, verbose, denoise_device)
 
-    # Phase 3: DiT Flow Embedder
-    fe_path = FLOW_EMBEDDER_PATH
-    if no_flow_embedder or NO_FLOW_EMBEDDER:
-        print("⏭️  Flow Embedder disabled (pure Flux reverse-flow).")
-    elif fe_path:
-        inferencer.load_flow_embedder(fe_path)
+    # Phase 3: ResFlow
+    resflow_path = RESFLOW_PATH
+    if no_resflow or NO_RESFLOW:
+        print("⏭️  ResFlow disabled (pure Flux reverse-flow).")
+    elif resflow_path:
+        inferencer.load_resflow(resflow_path)
     else:
-        print("⚠️  Flow Embedder not configured.")
+        print("⚠️  ResFlow not configured.")
 
     # Phase 4: 推理
     os.makedirs(out_dir, exist_ok=True)
@@ -595,7 +614,8 @@ def main(
         init_image=init_image, scale=scale, switch_t=switch_t, shift=shift,
         chopping_enabled=chopping_enabled,
         tile_size=tile_size,
-        tile_overlap=tile_overlap,
+        tile_stride=tile_stride,
+        color_correction=color_correction,
     )
 
 

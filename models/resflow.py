@@ -1,5 +1,5 @@
 """
-DiT Flow Embedder — LightningDiT 替代 U-Net 做速度预测
+ResFlow — Residual Flow Matching DiT
 
 输入:
   z_lr [B, 16, H, W]   LR latent (VAE encode 上采样 LR)
@@ -23,7 +23,7 @@ import yaml
 from .lightningdit import LightningDiT
 
 
-class DiTFlowEmbedder(nn.Module):
+class ResFlow(nn.Module):
     def __init__(
         self,
         input_size: int = 64,
@@ -85,8 +85,8 @@ class DiTFlowEmbedder(nn.Module):
         return self.dit.forward_flexible(inp, t, z=venc_fea)
 
 
-def create_dit_flow_embedder(cfg_path: str) -> DiTFlowEmbedder:
-    """从 YAML 配置文件创建 DiTFlowEmbedder。"""
+def create_resflow(cfg_path: str) -> ResFlow:
+    """从 YAML 配置文件创建 ResFlow。"""
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -97,7 +97,7 @@ def create_dit_flow_embedder(cfg_path: str) -> DiTFlowEmbedder:
     num_fused_layers = len(dv2.get("layer_dinov2b_list", [1]))
     encdim_ratio = dv2.get("encdim_ratio", 2)
 
-    return DiTFlowEmbedder(
+    return ResFlow(
         input_size=arch.get("input_size", 64),
         patch_size=arch.get("patch_size", 2),
         in_channels=arch.get("in_channels", 32),

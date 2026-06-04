@@ -1,7 +1,7 @@
-# DiT Flow Embedder 训练配置 — LightningDiT (VOSR-style, ~0.5B)
+# ResFlow 训练配置 — LightningDiT (VOSR-style, ~0.5B)
 
 # ---- 模型架构（引用外部配置） ----
-model_config: configs/flow_embedder.yaml
+model_config: configs/resflow.yaml
 
 # ---- 数据 ----
 data:
@@ -26,7 +26,11 @@ dinov2:
 training:
   iterations: 500000
   lr: 5.0e-5
-  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0
+  adam_epsilon: 1.0e-8
+  gradient_accumulation_steps: 1   
   gradient_clip: 1.0
   use_amp: true
   ema_rate: 0.999
@@ -38,8 +42,8 @@ flow:
 
 # ---- 日志 & 保存 ----
 experiment:
-  name: flow_embedder
-  save_dir: experiments/flow_embedder
+  name: resflow
+  save_dir: experiments/resflow
   log_freq: 1000
   save_freq: 1000
   keep_last_n: 3

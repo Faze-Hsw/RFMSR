@@ -1,1 +1,1 @@
-from .dit_flow_embedder import DiTFlowEmbedder, create_dit_flow_embedder
+from .resflow import ResFlow, create_resflow

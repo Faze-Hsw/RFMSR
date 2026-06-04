@@ -1,7 +1,7 @@
 """
-Flow Embedder 训练脚本 — LightningDiT 速度预测
+ResFlow 训练脚本 — LightningDiT 速度预测
 
-训练目标: DiT Embedder 学习 Residual Flow Matching — 从 LR→HR 的残差流。
+训练目标: ResFlow 学习 Residual Flow Matching — 从 LR→HR 的残差流。
 
 Residual Flow 路径: t=0 → HR latent, t=1 → z_lr + σ·ε
   x_t = z_hr + t·(z_lr - z_hr) + t·σ·ε
@@ -14,7 +14,7 @@ Residual Flow 路径: t=0 → HR latent, t=1 → z_lr + σ·ε
     → unpatchify → v [16ch]
 
 用法:
-  python train_flow_embedder.py
+  python train_resflow.py
 """
 
 import os
@@ -30,25 +30,31 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from safetensors.torch import save_file as safe_save
 from tqdm import tqdm
 
 from datapipe.train_dataloader import create_train_dataloader
 from flux.util import load_ae
-from models.dit_flow_embedder import create_dit_flow_embedder
+from models.resflow import create_resflow
 from models.dinov2_encoder import create_dinov2_encoder
+
+# CUDA 优化
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
 
 
 # =========================================================================
 # Trainer
 # =========================================================================
 
-class FlowEmbedderTrainer:
+class ResFlowTrainer:
 
     def __init__(self):
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(_script_dir, "configs", "train_flow_embedder.yaml")
+        config_path = os.path.join(_script_dir, "configs", "train_resflow.yaml")
         with open(config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
 
@@ -71,17 +77,21 @@ class FlowEmbedderTrainer:
         # ---- 加载模块 ----
         self._load_vae()
         self._load_dinov2()
-        self._build_embedder()
+        self._build_resflow()
         self._build_optimizer()
         self._build_dataloader()
         self._build_ema()
 
-        # AMP
+        # AMP (bf16 autocast，不使用 GradScaler)
         self.use_amp = self.cfg["training"]["use_amp"]
-        self.scaler = GradScaler() if self.use_amp else None
+
+        # 梯度累计
+        tcfg = self.cfg["training"]
+        self.accumulation_steps = tcfg.get("gradient_accumulation_steps", 1)
 
         # 训练状态
         self.global_step = 0
+        self.accumulation_count = 0
 
         self._print_summary()
 
@@ -119,18 +129,20 @@ class FlowEmbedderTrainer:
         else:
             self.venc = None
 
-    def _build_embedder(self):
+    def _build_resflow(self):
         cfg_path = self.cfg["model_config"]
-        self.embedder = create_dit_flow_embedder(cfg_path).to(self.device)
-        n_params = sum(p.numel() for p in self.embedder.parameters())
-        print(f"✅ LightningDiT Embedder: {n_params / 1e6:.1f}M params")
+        self.resflow = create_resflow(cfg_path).to(self.device)
+        n_params = sum(p.numel() for p in self.resflow.parameters())
+        print(f"✅ ResFlow: {n_params / 1e6:.1f}M params")
 
     def _build_optimizer(self):
         tcfg = self.cfg["training"]
         self.optimizer = torch.optim.AdamW(
-            self.embedder.parameters(),
+            self.resflow.parameters(),
             lr=tcfg["lr"],
-            weight_decay=tcfg["weight_decay"],
+            betas=(tcfg["adam_beta1"], tcfg["adam_beta2"]),
+            weight_decay=tcfg["adam_weight_decay"],
+            eps=tcfg["adam_epsilon"],
         )
 
     def _build_dataloader(self):
@@ -153,7 +165,7 @@ class FlowEmbedderTrainer:
         if rate > 0:
             self.ema_rate = rate
             self.ema_state = OrderedDict(
-                {k: deepcopy(v.data) for k, v in self.embedder.state_dict().items()}
+                {k: deepcopy(v.data) for k, v in self.resflow.state_dict().items()}
             )
         else:
             self.ema_rate = 0
@@ -161,13 +173,17 @@ class FlowEmbedderTrainer:
 
     def _print_summary(self):
         tcfg = self.cfg["training"]
+        dcfg = self.cfg["data"]
+        accum = self.accumulation_steps
         print("\n" + "=" * 60)
         print(f"Experiment      : {self.cfg['experiment']['name']}")
         print(f"Save dir        : {self.exp_dir}")
         print(f"Iterations      : {tcfg['iterations']}")
-        print(f"Batch size      : {self.cfg['data']['batch_size']}")
+        print(f"Batch size      : {dcfg['batch_size']}")
+        print(f"Accum steps     : {accum}")
+        print(f"Effective batch : {dcfg['batch_size'] * accum}")
         print(f"LR              : {tcfg['lr']}")
-        print(f"GT size         : {self.cfg['data']['gt_size']}")
+        print(f"GT size         : {dcfg['gt_size']}")
         print(f"Flow            : Residual FM (LR→HR), σ={self.sigma}")
         print(f"Architecture    : LightningDiT")
         print(f"Conditioning    : LR latent (VAE-encoded upsampled LR)" + 
@@ -218,31 +234,17 @@ class FlowEmbedderTrainer:
         x_t = z_hr + t_expand * residual + t_expand * self.sigma * epsilon
         v_gt = residual + self.sigma * epsilon
 
-        # 4. DiT Embedder + Loss
-        with autocast(device_type="cuda", enabled=self.use_amp):
-            v_super = self.embedder(x_t, t, z_lr, venc_fea=venc_fea)
-            loss = F.mse_loss(v_super, v_gt)
+        # 4. ResFlow + Loss (bf16 autocast)
+        #    梯度累计时 loss 需要 / accumulation_steps，保证有效梯度不变
+        loss_scale = 1.0 / self.accumulation_steps
+        with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+            v_super = self.resflow(x_t, t, z_lr, venc_fea=venc_fea)
+            loss = F.mse_loss(v_super, v_gt) * loss_scale
 
-        losses = {"velo": loss.item()}
+        losses = {"velo": loss.item() * self.accumulation_steps}  # 上报原始 scale
 
-        # 5. 反向传播
-        grad_clip = self.cfg["training"]["gradient_clip"]
-        self.optimizer.zero_grad()
-        if self.scaler is not None:
-            self.scaler.scale(loss).backward()
-            if grad_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.embedder.parameters(), grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.embedder.parameters(), grad_clip)
-            self.optimizer.step()
-
-        # EMA 更新
-        self._update_ema()
+        # 5. 反向传播（仅 backward，accumulation 由 train 循环管理）
+        loss.backward()
 
         return losses
 
@@ -254,7 +256,7 @@ class FlowEmbedderTrainer:
     def _update_ema(self):
         if self.ema_state is None:
             return
-        for k, v in self.embedder.state_dict().items():
+        for k, v in self.resflow.state_dict().items():
             if v.is_floating_point():
                 self.ema_state[k].mul_(self.ema_rate).add_(v.data, alpha=1 - self.ema_rate)
             else:
@@ -269,17 +271,16 @@ class FlowEmbedderTrainer:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         # 推理权重 (safetensors)
-        weights = self.ema_state if self.ema_state is not None else self.embedder.state_dict()
-        ema_path = ckpt_dir / f"flow_embedder_step{step}.safetensors"
+        weights = self.ema_state if self.ema_state is not None else self.resflow.state_dict()
+        ema_path = ckpt_dir / f"resflow_step{step}.safetensors"
         safe_save(weights, ema_path)
 
         # 完整训练状态 (torch.save)
         state = {
             "step": step,
-            "embedder": self.embedder.state_dict(),
+            "resflow": self.resflow.state_dict(),
             "ema_state": self.ema_state,
             "optimizer": self.optimizer.state_dict(),
-            "scaler": self.scaler.state_dict() if self.scaler else None,
         }
         state_path = ckpt_dir / f"training_state_step{step}.pth"
         torch.save(state, state_path)
@@ -292,8 +293,8 @@ class FlowEmbedderTrainer:
     def _cleanup_old_checkpoints(self, ckpt_dir: Path):
         """只保留最近 N 个检查点，删除其余。"""
         import re
-        # 收集所有检查点文件，按 step 分组
-        pattern = re.compile(r"(flow_embedder_step|training_state_step)(\d+)")
+        # 收集所有检查点文件，按 step 分组（兼容旧 flow_embedder_step 命名）
+        pattern = re.compile(r"(resflow_step|flow_embedder_step|training_state_step)(\d+)")
         ckpt_steps: dict[int, list[Path]] = {}
         for f in ckpt_dir.iterdir():
             m = pattern.match(f.name)
@@ -310,14 +311,22 @@ class FlowEmbedderTrainer:
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        self.embedder.load_state_dict(ckpt["embedder"])
+        # 兼容旧检查点：旧 key 为 "embedder"，新 key 为 "resflow"
+        state_dict_key = "resflow" if "resflow" in ckpt else "embedder"
+        self.resflow.load_state_dict(ckpt[state_dict_key])
         self.optimizer.load_state_dict(ckpt["optimizer"])
-        if self.scaler and ckpt.get("scaler"):
-            self.scaler.load_state_dict(ckpt["scaler"])
+        # overrides the old hyperparameters in the checkpoint with the current config
+        tcfg = self.cfg["training"]
+        for pg in self.optimizer.param_groups:
+            pg["lr"]        = tcfg["lr"]
+            pg["betas"]     = (tcfg["adam_beta1"], tcfg["adam_beta2"])
+            pg["weight_decay"] = tcfg["adam_weight_decay"]
+            pg["eps"]       = tcfg["adam_epsilon"]
         if ckpt.get("ema_state"):
             self.ema_state = ckpt["ema_state"]
         self.global_step = ckpt["step"]
-        print(f"✅ Resumed from step {self.global_step}")
+        old_key_note = " (old embedder format)" if state_dict_key == "embedder" else ""
+        print(f"✅ Resumed from step {self.global_step}{old_key_note}")
 
     # ------------------------------------------------------------------
     # 主训练循环
@@ -326,7 +335,9 @@ class FlowEmbedderTrainer:
     def train(self):
         tcfg = self.cfg["training"]
         total_iters = tcfg["iterations"]
-        self.embedder.train()
+        grad_clip = tcfg["gradient_clip"]
+        accum_steps = self.accumulation_steps
+        self.resflow.train()
 
         data_iter = iter(self.dataloader)
         pbar = tqdm(
@@ -336,8 +347,12 @@ class FlowEmbedderTrainer:
 
         ema_velo = 0.0
         ema_cnt = 0
+        self.accumulation_count = 0
 
         try:
+            # 首轮 zero_grad
+            self.optimizer.zero_grad()
+
             while self.global_step < total_iters:
                 try:
                     batch = next(data_iter)
@@ -345,24 +360,40 @@ class FlowEmbedderTrainer:
                     data_iter = iter(self.dataloader)
                     batch = next(data_iter)
 
+                # 前向 + 反向（loss 已在 train_step 内按 accum_steps 缩放）
                 loss_dict = self.train_step(batch)
-                self.global_step += 1
+                self.accumulation_count += 1
 
+                # 累计统计
                 ema_velo += loss_dict.get("velo", 0)
                 ema_cnt += 1
-
                 pbar.set_postfix(**{"velo": f"{loss_dict.get('velo', 0):.4f}"})
-                pbar.update(1)
 
-                if self.global_step % self.log_freq == 0:
-                    avg_v = ema_velo / max(ema_cnt, 1)
-                    lr = self.optimizer.param_groups[0]['lr']
-                    print(f"\n[step {self.global_step}/{total_iters}]  velo={avg_v:.6f}  lr={lr:.2e}")
-                    ema_velo = 0.0
-                    ema_cnt = 0
+                # 累计步数达到 → optimizer step
+                if self.accumulation_count >= accum_steps:
+                    # 梯度裁剪
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.resflow.parameters(), grad_clip)
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
 
-                if self.global_step % self.save_freq == 0:
-                    self.save_checkpoint(self.global_step)
+                    # EMA 更新（每个有效 step 一次）
+                    self._update_ema()
+
+                    self.global_step += 1
+                    self.accumulation_count = 0
+                    pbar.update(1)
+
+                    # 日志 & 保存
+                    if self.global_step % self.log_freq == 0:
+                        avg_v = ema_velo / max(ema_cnt, 1)
+                        lr = self.optimizer.param_groups[0]['lr']
+                        print(f"\n[step {self.global_step}/{total_iters}]  velo={avg_v:.6f}  lr={lr:.2e}")
+                        ema_velo = 0.0
+                        ema_cnt = 0
+
+                    if self.global_step % self.save_freq == 0:
+                        self.save_checkpoint(self.global_step)
 
             self.save_checkpoint(self.global_step)
             pbar.close()
@@ -379,11 +410,11 @@ class FlowEmbedderTrainer:
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train DiT Flow Embedder (LightningDiT)")
+    parser = argparse.ArgumentParser(description="Train ResFlow (LightningDiT)")
     parser.add_argument("--resume", type=str, default=None, help="Path to training state checkpoint")
     args = parser.parse_args()
 
-    trainer = FlowEmbedderTrainer()
+    trainer = ResFlowTrainer()
     if args.resume:
         trainer.load_checkpoint(args.resume)
     trainer.train()

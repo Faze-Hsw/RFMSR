@@ -5,7 +5,7 @@ DINOv2 编码器 — 冻结，从 LR 图片提取语义特征注入 DiT Cross-At
   export HF_ENDPOINT=https://hf-mirror.com   # AutoDL 等国内服务器
 
 用法:
-    encoder = create_dinov2_encoder("configs/flow_embedder.yaml", device="cuda")
+    encoder = create_dinov2_encoder("configs/resflow.yaml", device="cuda")
     features = encoder(lr_tensor)  # lr: [B,3,H,W] float [0,1] → list[[B,N,enc_dim]]
 """
 

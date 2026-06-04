@@ -5,4 +5,6 @@ outputs/
 checkpoints/
 .cache/
 testdata/
+traindata/
+experiments/
 *.safetensors

@@ -1,4 +1,4 @@
-# DiT Flow Embedder — LightningDiT 架构超参数
+# ResFlow — LightningDiT 架构超参数
 # 输入: cat(z_lr[16ch], x_t[16ch]) → [B, 32, H, W]
 # 输出: v [16ch] (速度预测)
 
