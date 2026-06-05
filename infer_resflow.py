@@ -6,19 +6,21 @@ ResFlow 推理脚本 — Residual Flow Matching 逆流积分
 逆流积分: t=1(LR+noise) → t=0(HR)
 
 用法:
-  python infer_resflow.py --init_image input.png
+  python infer_resflow.py --input input.png
 """
 
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HF_HOME"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 import math
+import glob
 import fire
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
+from pathlib import Path
 from PIL import Image
 from einops import rearrange, repeat
 from tqdm import tqdm
@@ -52,10 +54,10 @@ MODEL_NAME = _CFG.get("model_name", "flux-dev")
 RESFLOW_PATH = _CFG.get("resflow_path", "checkpoints/resflow.safetensors")
 MODEL_CONFIG = _CFG.get("model_config", "configs/resflow.yaml")
 FLOW_SIGMA = _CFG.get("flow_sigma", 1.0)
-INFER_STEPS = _CFG.get("infer_steps", 28)
+INFER_STEPS = _CFG.get("steps", 28)
 SCALE = _CFG.get("scale", 4.0)
 SEED = _CFG.get("seed", 42)
-OUT_DIR = _CFG.get("out_dir", "outputs")
+OUTPUT = _CFG.get("output", "outputs")
 DENOISE_DEVICE = _CFG.get("denoise_device", "cuda")
 
 _CHOPPING_CFG = _CFG.get("chopping", {})
@@ -149,10 +151,12 @@ class ResFlowInferencer:
 
     @torch.no_grad()
     def reverse_flow(self, z_lr: torch.Tensor, steps: int = 28,
-                     seed: int = 42, lr_pixel=None) -> torch.Tensor:
+                     flow_sigma: float = None, seed: int = 42,
+                     lr_pixel=None) -> torch.Tensor:
         """ResFlow 逆流积分: t=1 → t=0."""
         device = z_lr.device
         B, C, H, W = z_lr.shape
+        _sigma = flow_sigma if flow_sigma is not None else FLOW_SIGMA
 
         # DINOv2 全图一次
         venc_fea = None
@@ -164,7 +168,7 @@ class ResFlowInferencer:
 
         # 初始状态: LR latent + 噪声
         generator = torch.Generator(device=device).manual_seed(seed)
-        x = z_lr + FLOW_SIGMA * torch.randn(B, C, H, W, generator=generator, device=device)
+        x = z_lr + _sigma * torch.randn(B, C, H, W, generator=generator, device=device)
 
         step_pairs = list(zip(timesteps[:-1], timesteps[1:]))
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -182,18 +186,18 @@ class ResFlowInferencer:
 
     @torch.no_grad()
     def reverse_flow_tiled(self, z_lr: torch.Tensor, steps: int = 28,
-                           seed: int = 42, lt_size: int = 64,
-                           lt_stride: int = 32, lr_pixel=None) -> torch.Tensor:
+                           flow_sigma: float = None, seed: int = 42,
+                           lt_size: int = 64, lt_stride: int = 32,
+                           lr_pixel=None) -> torch.Tensor:
         """每步逐 tile 预测速度场并高斯加权融合回全图潜变量。"""
         device = z_lr.device
         B, C, H, W = z_lr.shape
+        _sigma = flow_sigma if flow_sigma is not None else FLOW_SIGMA
         AE_FACTOR = 8
 
         # tile 网格
         h_tiles = self._make_tile_grid(H, lt_size, lt_stride)
         w_tiles = self._make_tile_grid(W, lt_size, lt_stride)
-        print(f"   Tile grid: {len(h_tiles)}×{len(w_tiles)} "
-              f"({lt_size}×{lt_size} latent, stride={lt_stride})")
 
         # Per-tile DINOv2 预计算
         tile_venc = {}
@@ -207,14 +211,13 @@ class ResFlowInferencer:
                         pw_e = min(we * AE_FACTOR, lr_pixel.shape[3])
                         lq_crop = lr_pixel[:, :, ph_s:ph_e, pw_s:pw_e]
                         tile_venc[(hs, ws)] = self.venc(lq_crop)
-            print(f"   DINOv2: {len(tile_venc)} per-tile features extracted")
 
         # 时间步
         timesteps = torch.linspace(1.0, 0.0, steps + 1, device=device)
 
         # 初始状态: 全图噪声（所有 tile 共享）
         generator = torch.Generator(device=device).manual_seed(seed)
-        x = z_lr + FLOW_SIGMA * torch.randn(B, C, H, W, generator=generator, device=device)
+        x = z_lr + _sigma * torch.randn(B, C, H, W, generator=generator, device=device)
 
         # 高斯融合权重
         g_weight = self._gaussian_weights(lt_size, lt_size, C, device)
@@ -250,15 +253,16 @@ class ResFlowInferencer:
     # ---- 主入口 ----
 
     def infer(self, init_image: str, scale: float = SCALE, steps: int = None,
-              seed: int = SEED, chopping: bool = None,
-              tile_size: int = None, tile_stride: int = None,
-              color_correction: str = 'none') -> Image.Image:
+              flow_sigma: float = None, seed: int = SEED,
+              chopping: bool = None, tile_size: int = None,
+              tile_stride: int = None, color_correction: str = 'none') -> Image.Image:
         """输入图片 → ResFlow 超分 → 输出图片。
 
         Args:
             color_correction: 颜色校正方法 ('adain', 'wavelet', 'ycbcr', 'none').
         """
         _steps = steps or INFER_STEPS
+        _sigma = flow_sigma if flow_sigma is not None else FLOW_SIGMA
         _chopping = chopping if chopping is not None else CHOPPING_ENABLED
         _tile_size = tile_size or TILE_SIZE
         _tile_stride = tile_stride or TILE_STRIDE
@@ -284,7 +288,6 @@ class ResFlowInferencer:
         pad_w = (math.ceil(w / MOD_PIXEL) * MOD_PIXEL) - w
         if pad_h > 0 or pad_w > 0:
             im_cond = F.pad(im_cond, (0, pad_w, 0, pad_h), mode="reflect")
-            print(f"Align pad: +({pad_w},{pad_h}) → {im_cond.shape[-1]}x{im_cond.shape[-2]}")
 
         # ---- VAE 全局编码 ----
         image_tensor = im_cond * 2.0 - 1.0
@@ -305,14 +308,11 @@ class ResFlowInferencer:
         use_tiling = _chopping and (lh > lt_size or lw > lt_size)
 
         if not use_tiling:
-            print(f"ResFlow: {ori_w}x{ori_h} (latent {lw}×{lh}), "
-                  f"{_steps} steps, σ={FLOW_SIGMA}")
-            z_hr = self.reverse_flow(z_lr, steps=_steps, seed=seed, lr_pixel=lr_pixel)
+            z_hr = self.reverse_flow(z_lr, steps=_steps, flow_sigma=_sigma,
+                                     seed=seed, lr_pixel=lr_pixel)
         else:
-            print(f"ResFlow (tiled): {ori_w}x{ori_h} (latent {lw}×{lh}), "
-                  f"tile={lt_size}×{lt_size} latent (~{_tile_size}px), {_steps} steps")
             z_hr = self.reverse_flow_tiled(
-                z_lr, steps=_steps, seed=seed,
+                z_lr, steps=_steps, flow_sigma=_sigma, seed=seed,
                 lt_size=lt_size, lt_stride=lt_stride,
                 lr_pixel=lr_pixel,
             )
@@ -338,10 +338,11 @@ class ResFlowInferencer:
 # ================================================================================
 
 def main(
-    init_image: str = None,
-    out_dir: str = OUT_DIR,
+    input: str = None,
+    output: str = OUTPUT,
     scale: float = SCALE,
     steps: int = None,
+    flow_sigma: float = None,
     seed: int = SEED,
     chopping: bool = None,
     tile_size: int = None,
@@ -351,45 +352,76 @@ def main(
     """ResFlow Residual Flow Matching 超分推理。
 
     Args:
-        init_image:   输入图片路径 (必填)
-        out_dir:      输出目录
+        input:        输入图片或文件夹路径 (必填)
+        output:       输出目录
         scale:        放大倍数
-        steps:        逆流积分步数 (默认 28)
+        steps:        逆流积分步数 (默认从配置读取)
+        flow_sigma:   噪声标准差 (默认从配置读取)
         seed:         随机种子
-        chopping:     是否启用分块推理 (默认 True)
+        chopping:     是否启用分块推理 (默认从配置读取)
         tile_size:    像素空间 tile 大小
         tile_stride:  像素空间 stride
         color_correction: 颜色校正方法 ('adain', 'wavelet', 'ycbcr', 'none').
     """
+    init_image = input
     if init_image is None:
-        raise ValueError("必须提供 --init_image 参数。")
+        raise ValueError("必须提供 --input 参数。")
 
     _steps = steps or INFER_STEPS
+    _sigma = flow_sigma if flow_sigma is not None else FLOW_SIGMA
+    src_path = Path(init_image)
+    if src_path.is_dir():
+        # 批量文件夹推理
+        IMG_EXTS = {"*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp", "*.tiff"}
+        img_files = []
+        for ext in IMG_EXTS:
+            img_files.extend(glob.glob(str(src_path / f"**/{ext}"), recursive=True))
+        img_files = sorted(set(img_files))
+        if not img_files:
+            raise ValueError(f"文件夹 {init_image} 中未找到图片文件")
+        img_files_base = [p for p in img_files]  # for relative path computation
+    else:
+        img_files_base = [init_image]
+        img_files = [init_image]
+
     print(f"\n{'=' * 50}")
     print(f"ResFlow Residual FM Inference")
     print(f"  Input:    {init_image}")
+    if src_path.is_dir():
+        print(f"  Images:   {len(img_files)}")
     print(f"  Scale:    {scale}×")
     print(f"  Steps:    {_steps}")
-    print(f"  Sigma:    {FLOW_SIGMA}")
+    print(f"  Sigma:    {_sigma}")
     print(f"  Seed:     {seed}")
     print(f"  Tiling:   {chopping if chopping is not None else CHOPPING_ENABLED}")
     print(f"  Color Fix:{color_correction}")
+    print(f"  Output:   {output}")
     print(f"{'=' * 50}\n")
 
     inferencer = ResFlowInferencer()
     inferencer.load()
 
-    result = inferencer.infer(
-        init_image=init_image, scale=scale, steps=_steps, seed=seed,
-        chopping=chopping, tile_size=tile_size, tile_stride=tile_stride,
-        color_correction=color_correction,
-    )
+    out_root = Path(output)
+    pbar = tqdm(img_files, desc="Inference", unit="img")
+    for img_path in pbar:
+        rel_path = os.path.relpath(img_path, init_image) if src_path.is_dir() else os.path.basename(img_path)
+        base_name = os.path.splitext(rel_path)[0]
+        save_path = out_root / f"{base_name}.png"
+        save_path.parent.mkdir(parents=True, exist_ok=True)
 
-    os.makedirs(out_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(init_image))[0]
-    save_path = os.path.join(out_dir, f"{base}.png")
-    result.save(save_path)
-    print(f"\nSaved: {save_path}")
+        pbar.set_postfix_str(rel_path[:40])
+        try:
+            result = inferencer.infer(
+                init_image=img_path, scale=scale, steps=_steps,
+                flow_sigma=_sigma, seed=seed,
+                chopping=chopping, tile_size=tile_size, tile_stride=tile_stride,
+                color_correction=color_correction,
+            )
+            result.save(str(save_path))
+        except Exception as e:
+            tqdm.write(f"  ❌ {rel_path}: {e}")
+
+    print(f"\nDone. 输出目录: {out_root.resolve()}")
 
 
 if __name__ == "__main__":

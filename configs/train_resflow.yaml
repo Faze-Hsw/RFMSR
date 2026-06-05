@@ -39,6 +39,10 @@ training:
 # ---- Residual Flow Matching ----
 flow:
   sigma: 1.0          # 噪声标准差
+  time_dist: uniform  # 时间分布: uniform | lognorm
+  # lognorm 参数（仅 time_dist=lognorm 时生效）
+  lognorm_mu: 0.0
+  lognorm_sigma: 1.0
 
 # ---- 日志 & 保存 ----
 experiment:

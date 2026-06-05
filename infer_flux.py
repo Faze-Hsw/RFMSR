@@ -6,17 +6,19 @@ Flux 超分推理脚本 — ResFlow 两阶段 Residual Flow 版本
   Phase 2 (switch_t → t=0): Flux    — 质量精修，去伪影、加细节
 
 用法:
-  python infer_flux.py --init_image input.png --scale 2.0 --switch_t 0.5
+  python infer_flux.py --input input.png --scale 2.0 --switch_t 0.5
 """
 
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HF_HOME"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 import math
+import glob
 import fire
 import cv2
 import numpy as np
 import torch
+from pathlib import Path
 import torch.nn.functional as F
 import yaml
 from PIL import Image
@@ -57,7 +59,7 @@ SEED = _CFG.get("seed", 42)
 _WEIGHTS_CFG = _CFG.get("weights", {})
 T5XXL_PATH = _WEIGHTS_CFG.get("t5xxl", None)
 CLIP_PATH = _WEIGHTS_CFG.get("clip", None)
-OUTDIR = _CFG.get("out_dir", "outputs")
+OUTDIR = _CFG.get("output", "outputs")
 VERBOSE = _CFG.get("verbose", False)
 SCALE = _CFG.get("scale", 1.0)
 SHIFT = _CFG.get("shift", True)
@@ -75,7 +77,7 @@ FLOW_SIGMA = _CFG.get("flow_sigma", 1.0)
 T5_MAX_LENGTH = _CFG.get("t5_max_length", 512)
 
 # 推理步数（逆流积分步数）
-INFER_STEPS = _CFG.get("infer_steps", 28)
+INFER_STEPS = _CFG.get("steps", 28)
 
 # 两阶段切换时间点 switch_t ∈ [0,1]
 # t ∈ (switch_t, 1.0] → DiT Embedder (Residual FM)
@@ -174,7 +176,7 @@ class FluxInferencer:
                                switch_t: float = 0.5,
                                steps: int = 28, guidance: float = 3.5,
                                shift: bool = True, seed: int = 42,
-                               lr_pixel=None) -> torch.Tensor:
+                               lr_pixel=None, flow_sigma=None) -> torch.Tensor:
         """
         两阶段逆流积分: t=1(LR+noise) → t=0(HR)
 
@@ -183,6 +185,7 @@ class FluxInferencer:
         """
         device = z_lr.device
         B, C, H, W = z_lr.shape
+        _sigma = flow_sigma if flow_sigma is not None else FLOW_SIGMA
         h_pack, w_pack = H // 2, W // 2
         seq_len = h_pack * w_pack
 
@@ -202,11 +205,11 @@ class FluxInferencer:
         # ---- 时间步调度 ----
         timesteps = self._get_schedule(steps, seq_len, shift=shift)
         self.print(f"   2-stage flow: {steps} steps, t: 1.0 → 0.0"
-                   f"{', shift' if shift else ''}, switch_t={switch_t:.3f}, σ={FLOW_SIGMA}")
+                   f"{', shift' if shift else ''}, switch_t={switch_t:.3f}, σ={_sigma}")
 
         # ---- 初始状态: LR latent + 扰动 (Residual FM 起点) ----
         generator = torch.Generator(device=device).manual_seed(seed)
-        x = z_lr + FLOW_SIGMA * torch.randn(B, C, H, W, generator=generator, device=device)
+        x = z_lr + _sigma * torch.randn(B, C, H, W, generator=generator, device=device)
 
         # ---- 逐步逆流积分 ----
         step_pairs = list(zip(timesteps[:-1], timesteps[1:]))
@@ -335,11 +338,12 @@ class FluxInferencer:
         switch_t: float = 0.5, steps: int = 28, guidance: float = 3.5,
         shift: bool = True, seed: int = 42,
         lt_size: int = 64, lt_stride: int = 32,
-        lr_pixel=None,
+        lr_pixel=None, flow_sigma=None,
     ) -> torch.Tensor:
         """Latent 空间分 tile 的两阶段逆流积分（VOSR 风格：每 tile 独立 DINOv2）。"""
         device = z_lr.device
         B, C, H, W = z_lr.shape
+        _sigma = flow_sigma if flow_sigma is not None else FLOW_SIGMA
         h_pack_full, w_pack_full = H // 2, W // 2
         seq_len = h_pack_full * w_pack_full
 
@@ -353,7 +357,7 @@ class FluxInferencer:
         # ---- 时间步调度 ----
         timesteps = self._get_schedule(steps, seq_len, shift=shift)
         self.print(f"   Tiled 2-stage flow: {steps} steps, t: 1.0 → 0.0"
-                   f"{', shift' if shift else ''}, switch_t={switch_t:.3f}, σ={FLOW_SIGMA}")
+                   f"{', shift' if shift else ''}, switch_t={switch_t:.3f}, σ={_sigma}")
 
         # ---- tile 网格 ----
         h_tiles = self._make_tile_grid(H, lt_size, lt_stride)
@@ -378,7 +382,7 @@ class FluxInferencer:
 
         # ---- 初始状态: LR latent + 扰动 (Residual FM 起点) ----
         generator = torch.Generator(device=device).manual_seed(seed)
-        x = z_lr + FLOW_SIGMA * torch.randn(B, C, H, W, generator=generator, device=device)
+        x = z_lr + _sigma * torch.randn(B, C, H, W, generator=generator, device=device)
 
         # ---- 高斯融合权重 ----
         g_weight = self._gaussian_weights(lt_size, lt_size, C, device)
@@ -449,16 +453,18 @@ class FluxInferencer:
                   cfg_scale=CFG_SCALE, seed=SEED, out_dir=OUTDIR,
                   init_image=None, scale=1.0, switch_t=0.5, shift=True,
                   chopping_enabled=False, tile_size=512, tile_stride=256,
-                  color_correction='none'):
+                  color_correction='none', flow_sigma=None):
         """img2img 超分/增强。"""
         if init_image is None:
             raise ValueError("必须提供 init_image 参数。")
 
         _steps = steps if steps is not None else INFER_STEPS
+        _sigma = flow_sigma if flow_sigma is not None else FLOW_SIGMA
 
         image = self._gen_img2img(
             init_image, scale, switch_t, seed, _steps, cfg_scale, shift,
             chopping_enabled, tile_size, tile_stride, color_correction,
+            _sigma,
         )
 
         base_name = os.path.splitext(os.path.basename(init_image))[0]
@@ -470,7 +476,7 @@ class FluxInferencer:
     def _gen_img2img(self, init_image, scale, switch_t, seed,
                      steps, cfg_scale, shift,
                      chopping_enabled, tile_size, tile_stride,
-                     color_correction='none') -> Image.Image:
+                     color_correction='none', flow_sigma=None) -> Image.Image:
         """img2img 核心逻辑：VAE 全局编码 → latent 分 tile 推理 → 高斯融合 → VAE 全局解码。"""
         AE_FACTOR = 8
         PATCH_SIZE = 2  # LightningDiT patch size
@@ -519,7 +525,7 @@ class FluxInferencer:
             z_hr = self.reverse_flow_sampling(
                 z_lr, switch_t=switch_t,
                 steps=steps, guidance=cfg_scale, shift=shift, seed=seed,
-                lr_pixel=lr_pixel,
+                lr_pixel=lr_pixel, flow_sigma=flow_sigma,
             )
         else:
             print(f"📐 Latent tiling 推理: {ori_w}x{ori_h} (latent {lw}×{lh}), "
@@ -528,7 +534,7 @@ class FluxInferencer:
                 z_lr, switch_t=switch_t,
                 steps=steps, guidance=cfg_scale, shift=shift, seed=seed,
                 lt_size=lt_size, lt_stride=lt_stride,
-                lr_pixel=lr_pixel,
+                lr_pixel=lr_pixel, flow_sigma=flow_sigma,
             )
 
         # ---- VAE 全局解码一次 ----
@@ -559,14 +565,14 @@ class FluxInferencer:
 def main(
     model_name=MODEL_NAME,
     prompt=PROMPT,
-    out_dir=OUTDIR,
+    output=OUTDIR,
     seed=SEED,
     steps=None,
     cfg=None,
     verbose=VERBOSE,
     text_encoder_device=TEXT_ENCODER_DEVICE,
     denoise_device=DENOISE_DEVICE,
-    init_image=None,
+    input=None,
     scale=SCALE,
     switch_t=SWITCH_T,
     shift=SHIFT,
@@ -574,16 +580,38 @@ def main(
     chopping_enabled=CHOPPING_ENABLED,
     tile_size=TILE_SIZE,
     tile_stride=TILE_STRIDE,
-    no_resflow=False,
+    no_resflow=None,
     color_correction=COLOR_CORRECTION,
+    flow_sigma=None,
 ):
     """Flux 两阶段 Residual Flow 超分推理 (ResFlow + Flux)。
 
     Phase 1 (t ∈ [switch_t, 1.0]): ResFlow — z_lr+noise 起点，Residual FM
     Phase 2 (t ∈ [0, switch_t]):   Flux    — 质量精修
     """
+    init_image = input
     _steps = steps if steps is not None else INFER_STEPS
     _cfg = cfg if cfg is not None else CFG_SCALE
+    _sigma = flow_sigma if flow_sigma is not None else FLOW_SIGMA
+
+    src_path = Path(init_image) if init_image else None
+    if src_path is None:
+        raise ValueError("必须提供 --input 参数。")
+    if src_path.is_dir():
+        IMG_EXTS = {"*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp", "*.tiff"}
+        img_files = []
+        for ext in IMG_EXTS:
+            img_files.extend(glob.glob(str(src_path / f"**/{ext}"), recursive=True))
+        img_files = sorted(set(img_files))
+        if not img_files:
+            raise ValueError(f"文件夹 {init_image} 中未找到图片文件")
+    else:
+        img_files = [init_image]
+
+    print(f"\n{'=' * 50}")
+    print(f"Flux + ResFlow 两阶段推理")
+    if src_path.is_dir():
+        print(f"  Images:   {len(img_files)}")
 
     inferencer = FluxInferencer()
 
@@ -595,12 +623,14 @@ def main(
     inferencer.prepare_conditions(prompt)
     inferencer.free_text_encoders()
 
-    # Phase 2: Flux + VAE
-    inferencer.load(model_name, verbose, denoise_device)
+    # Phase 2: Flux + VAE (batch 时禁用 verbose 避免破坏进度条)
+    is_batch = src_path.is_dir()
+    inferencer.load(model_name, verbose and not is_batch, denoise_device)
 
     # Phase 3: ResFlow
     resflow_path = RESFLOW_PATH
-    if no_resflow or NO_RESFLOW:
+    _no_resflow = no_resflow if no_resflow is not None else NO_RESFLOW
+    if _no_resflow:
         print("⏭️  ResFlow disabled (pure Flux reverse-flow).")
     elif resflow_path:
         inferencer.load_resflow(resflow_path)
@@ -608,15 +638,29 @@ def main(
         print("⚠️  ResFlow not configured.")
 
     # Phase 4: 推理
-    os.makedirs(out_dir, exist_ok=True)
-    inferencer.gen_image(
-        prompt, "", _steps, _cfg, seed, out_dir,
-        init_image=init_image, scale=scale, switch_t=switch_t, shift=shift,
-        chopping_enabled=chopping_enabled,
-        tile_size=tile_size,
-        tile_stride=tile_stride,
-        color_correction=color_correction,
-    )
+    out_root = Path(output)
+    pbar = tqdm(img_files, desc="Inference", unit="img")
+    for img_path in pbar:
+        rel_path = os.path.relpath(img_path, init_image) if src_path.is_dir() else os.path.basename(img_path)
+        base_name = os.path.splitext(rel_path)[0]
+        save_path = out_root / f"{base_name}.png"
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        pbar.set_postfix_str(rel_path[:40])
+        try:
+            inferencer.gen_image(
+                prompt, "", _steps, _cfg, seed, str(save_path.parent),
+                init_image=img_path, scale=scale, switch_t=switch_t, shift=shift,
+                chopping_enabled=chopping_enabled,
+                tile_size=tile_size,
+                tile_stride=tile_stride,
+                color_correction=color_correction,
+                flow_sigma=_sigma,
+            )
+        except Exception as e:
+            tqdm.write(f"  ❌ {rel_path}: {e}")
+
+    print(f"\nDone. 输出目录: {out_root.resolve()}")
 
 
 if __name__ == "__main__":

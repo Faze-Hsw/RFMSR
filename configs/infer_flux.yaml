@@ -25,13 +25,13 @@ shift: false           # 时间步 shift（高噪声区分配更多步数）
 switch_t: 0.5
 
 # 逆流积分步数 (1.0 → 0.0, 步数越多质量越好但越慢)
-infer_steps: 20
+steps: 20
 
 # T5 最大序列长度
 t5_max_length: 512
 
 # 输出目录
-out_dir: outputs
+output: outputs
 
 verbose: true
 

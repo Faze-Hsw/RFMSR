@@ -64,6 +64,9 @@ class ResFlowTrainer:
         # Residual Flow Matching
         flow_cfg = self.cfg.get("flow", {})
         self.sigma = flow_cfg.get("sigma", 1.0)
+        self.time_dist = flow_cfg.get("time_dist", "uniform")
+        self.lognorm_mu = flow_cfg.get("lognorm_mu", 0.0)
+        self.lognorm_sigma = flow_cfg.get("lognorm_sigma", 1.0)
 
         # ---- 实验目录 ----
         exp = self.cfg["experiment"]
@@ -182,14 +185,27 @@ class ResFlowTrainer:
         print(f"Batch size      : {dcfg['batch_size']}")
         print(f"Accum steps     : {accum}")
         print(f"Effective batch : {dcfg['batch_size'] * accum}")
-        print(f"LR              : {tcfg['lr']}")
+        print(f"Learning Rate   : {tcfg['lr']}")
+        print(f"Weight Decay    : {tcfg['adam_weight_decay']}")
         print(f"GT size         : {dcfg['gt_size']}")
-        print(f"Flow            : Residual FM (LR→HR), σ={self.sigma}")
-        print(f"Architecture    : LightningDiT")
+        print(f"Flow            : Residual FM (LR→HR), σ={self.sigma}, t~{self.time_dist}")
         print(f"Conditioning    : LR latent (VAE-encoded upsampled LR)" + 
               (" + DINOv2 Cross-Attn" if self.use_dinov2 else ""))
         print(f"AMP             : {self.use_amp}")
         print("=" * 60 + "\n")
+
+    def _sample_t(self, B: int, device: torch.device) -> torch.Tensor:
+        """按配置的时间分布采样 t ∈ [0,1]。
+
+        uniform:  t ~ U(0, 1)
+        lognorm:  t = sigmoid(N(μ, σ))，中间密度更高
+        """
+        if self.time_dist == "lognorm":
+            rnd = torch.randn(B, device=device)
+            t = torch.sigmoid(rnd * self.lognorm_sigma + self.lognorm_mu)
+        else:
+            t = torch.rand(B, device=device)
+        return t
 
     # ------------------------------------------------------------------
     # VAE encode
@@ -227,7 +243,7 @@ class ResFlowTrainer:
             venc_fea = self.venc(lr)
 
         # 3. Residual Flow: x_t = z_hr + t·(z_lr - z_hr) + t·σ·ε
-        t = torch.rand(B, device=device)
+        t = self._sample_t(B, device)
         t_expand = t[:, None, None, None]
         epsilon = torch.randn_like(z_hr)
         residual = z_lr - z_hr
@@ -293,8 +309,8 @@ class ResFlowTrainer:
     def _cleanup_old_checkpoints(self, ckpt_dir: Path):
         """只保留最近 N 个检查点，删除其余。"""
         import re
-        # 收集所有检查点文件，按 step 分组（兼容旧 flow_embedder_step 命名）
-        pattern = re.compile(r"(resflow_step|flow_embedder_step|training_state_step)(\d+)")
+        # 收集所有检查点文件，按 step 分组
+        pattern = re.compile(r"(resflow_step|training_state_step)(\d+)")
         ckpt_steps: dict[int, list[Path]] = {}
         for f in ckpt_dir.iterdir():
             m = pattern.match(f.name)
@@ -311,9 +327,7 @@ class ResFlowTrainer:
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        # 兼容旧检查点：旧 key 为 "embedder"，新 key 为 "resflow"
-        state_dict_key = "resflow" if "resflow" in ckpt else "embedder"
-        self.resflow.load_state_dict(ckpt[state_dict_key])
+        self.resflow.load_state_dict(ckpt["resflow"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         # overrides the old hyperparameters in the checkpoint with the current config
         tcfg = self.cfg["training"]
@@ -325,8 +339,7 @@ class ResFlowTrainer:
         if ckpt.get("ema_state"):
             self.ema_state = ckpt["ema_state"]
         self.global_step = ckpt["step"]
-        old_key_note = " (old embedder format)" if state_dict_key == "embedder" else ""
-        print(f"✅ Resumed from step {self.global_step}{old_key_note}")
+        print(f"✅ Resumed from step {self.global_step}")
 
     # ------------------------------------------------------------------
     # 主训练循环
@@ -347,6 +360,7 @@ class ResFlowTrainer:
 
         ema_velo = 0.0
         ema_cnt = 0
+        accum_velo = 0.0
         self.accumulation_count = 0
 
         try:
@@ -364,10 +378,11 @@ class ResFlowTrainer:
                 loss_dict = self.train_step(batch)
                 self.accumulation_count += 1
 
-                # 累计统计
+                # 累计统计（日志用）
                 ema_velo += loss_dict.get("velo", 0)
                 ema_cnt += 1
-                pbar.set_postfix(**{"velo": f"{loss_dict.get('velo', 0):.4f}"})
+                # 当次累计步内的 velo 累积（进度条显示用）
+                accum_velo += loss_dict.get("velo", 0)
 
                 # 累计步数达到 → optimizer step
                 if self.accumulation_count >= accum_steps:
@@ -381,7 +396,11 @@ class ResFlowTrainer:
                     self._update_ema()
 
                     self.global_step += 1
+                    # 进度条显示当前累计步内的平均 velo
+                    step_avg = accum_velo / self.accumulation_count
+                    pbar.set_postfix(**{"velo": f"{step_avg:.4f}"})
                     self.accumulation_count = 0
+                    accum_velo = 0.0
                     pbar.update(1)
 
                     # 日志 & 保存
