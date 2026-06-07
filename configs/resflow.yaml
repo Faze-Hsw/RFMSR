@@ -1,12 +1,12 @@
-# ResFlow — LightningDiT 架构超参数
-# 输入: cat(z_lr[16ch], x_t[16ch]) → [B, 32, H, W]
-# 输出: v [16ch] (速度预测)
+# ResFlow — LightningDiT 架构超参数（SD2.1 VAE 潜空间）
+# 输入: cat(z_lr[4ch], x_t[4ch]) → [B, 8, H, W]
+# 输出: v [4ch] (速度预测)
 
 dit_arch:
   input_size: 64              # latent H (512/8=64)
   patch_size: 2               # patchify 尺寸
-  in_channels: 32             # z_lr(16) + x_t(16)
-  out_channels: 16            # velocity output
+  in_channels: 8              # z_lr(4) + x_t(4)
+  out_channels: 4             # velocity output (SD2.1 latent)
   hidden_size: 1024           # 0.5B params
   depth: 28                   # DiT block 层数
   num_heads: 16               # 注意力头数
@@ -24,4 +24,4 @@ dinov2:
   enc_dim: 768                # DINOv2 特征维度 (dinov2b=768, dinov2l=1024, dinov2g=1536)
   dinov2_size: 448            # 输入 resize 尺寸
   layer_dinov2b_list: [8]     # 注入哪一层 DINOv2 特征 (0-based, ViT-B共12层, ViT-L共24层)
-  encdim_ratio: 2             # mlp_ca 扩展比
+  encdim_ratio: 3             # mlp_ca 扩展比

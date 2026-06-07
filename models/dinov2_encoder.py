@@ -1,14 +1,15 @@
 """
 DINOv2 编码器 — 冻结，从 LR 图片提取语义特征注入 DiT Cross-Attention。
 
-使用 HuggingFace transformers 自动下载权重：
-  export HF_ENDPOINT=https://hf-mirror.com   # AutoDL 等国内服务器
+使用 torch.hub 下载权重（与 VOSR 一致），缓存至 ckpts/torch_cache。
 
 用法:
     encoder = create_dinov2_encoder("configs/resflow.yaml", device="cuda")
     features = encoder(lr_tensor)  # lr: [B,3,H,W] float [0,1] → list[[B,N,enc_dim]]
 """
 
+import os
+import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,10 +18,10 @@ from torchvision.transforms import Normalize
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-DINOV2_HF_MODELS = {
-    "dinov2b": "facebook/dinov2-base",
-    "dinov2l": "facebook/dinov2-large",
-    "dinov2g": "facebook/dinov2-giant",
+DINOV2_HUB_NAMES = {
+    "dinov2b": "dinov2_vitb14",
+    "dinov2l": "dinov2_vitl14",
+    "dinov2g": "dinov2_vitg14",
 }
 
 
@@ -39,24 +40,43 @@ class Dinov2Encoder(nn.Module):
         self.dinov2_size = dinov2_size
         self.layer_indices = layer_indices or [8]
 
-        model_name = DINOV2_HF_MODELS.get(enc_type)
-        if model_name is None:
+        hub_name = DINOV2_HUB_NAMES.get(enc_type)
+        if hub_name is None:
             raise ValueError(
                 f"Unknown DINOv2 type: {enc_type}, "
-                f"expected one of {list(DINOV2_HF_MODELS)}"
+                f"expected one of {list(DINOV2_HUB_NAMES)}"
             )
 
-        print(f"Loading DINOv2 from HuggingFace: {model_name} ...")
-        try:
-            from transformers import AutoModel
-            self.encoder = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load DINOv2 from HuggingFace: {e}\n"
-                f"设置镜像重试: export HF_ENDPOINT=https://hf-mirror.com"
-            )
+        # 设置 torch.hub 缓存目录（与 VOSR 一致）
+        cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                 "ckpts", "torch_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        torch.hub.set_dir(cache_dir)
 
-        self.encoder = self.encoder.to(device).eval()
+        print(f"Loading DINOv2 from torch.hub: facebookresearch/dinov2 → {hub_name} ...")
+        encoder = torch.hub.load('facebookresearch/dinov2', hub_name)
+
+        # 去掉分类头，替换为 Identity
+        del encoder.head
+        encoder.head = torch.nn.Identity()
+
+        # 注入 forward_with_features 方法（与 VOSR 完全一致）
+        def forward_with_features(self, x, masks=None):
+            features = {}
+            layer_indices = list(range(len(self.blocks)))
+            if isinstance(x, list):
+                return self.forward_features_list(x, masks)
+            x = self.prepare_tokens_with_masks(x, masks)
+            for i, blk in enumerate(self.blocks):
+                x = blk(x)
+                if i in layer_indices:
+                    features[f'layer_{i}'] = x[:, 1:]  # 去掉 CLS token
+            x_norm = self.norm(x)
+            return features, x_norm[:, 1:]
+
+        encoder.forward_with_features = types.MethodType(forward_with_features, encoder)
+
+        self.encoder = encoder.to(device).eval()
         for p in self.encoder.parameters():
             p.requires_grad_(False)
 
@@ -80,24 +100,12 @@ class Dinov2Encoder(nn.Module):
         """
         x = self.preprocess(lr)
 
-        outputs = self.encoder(
-            pixel_values=x,
-            output_hidden_states=True,
-            interpolate_pos_encoding=True,
-        )
+        features, x_norm = self.encoder.forward_with_features(x)
+        z = [v for k, v in features.items() if k.startswith('layer_')]
+        z[-1] = x_norm
+        z = [z[i] for i in self.layer_indices]
 
-        # hidden_states: (embedding, block_0, block_1, ..., block_L)
-        # hs[0] = patch_embed + pos_embed, hs[i] = block i-1 的输出
-        hidden_states = outputs.hidden_states
-
-        z_list = []
-        for idx in self.layer_indices:
-            z_list.append(hidden_states[idx + 1][:, 1:, :])  # +1 跳过 embedding 层，去 CLS token
-
-        # 最后一层用最终 hidden state
-        z_list[-1] = hidden_states[-1][:, 1:, :]
-
-        return z_list
+        return z
 
 
 def create_dinov2_encoder(config_path: str, device: str = "cuda") -> Dinov2Encoder | None:

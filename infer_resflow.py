@@ -1,7 +1,7 @@
 """
-ResFlow 推理脚本 — Residual Flow Matching 逆流积分
+ResFlow 推理脚本 — Residual Flow Matching 逆流积分 (SD2.1 VAE)
 
-使用 ResFlow (LightningDiT) 做速度预测，无 Flux 第二阶段。
+使用 ResFlow (LightningDiT) 做速度预测，SD2.1 VAE 编解码。
 流路径: x_t = z_hr + t·(z_lr - z_hr) + t·σ·ε
 逆流积分: t=1(LR+noise) → t=0(HR)
 
@@ -10,8 +10,6 @@ ResFlow 推理脚本 — Residual Flow Matching 逆流积分
 """
 
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["HF_HOME"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 import math
 import glob
 import fire
@@ -26,7 +24,6 @@ from einops import rearrange, repeat
 from tqdm import tqdm
 
 from safetensors.torch import load_file as safe_load
-from flux.util import load_ae
 from models.resflow import create_resflow
 from models.dinov2_encoder import create_dinov2_encoder
 from utils.color_fix import apply_color_fix
@@ -50,8 +47,8 @@ def load_config() -> dict:
 
 _CFG = load_config()
 
-MODEL_NAME = _CFG.get("model_name", "flux-dev")
-RESFLOW_PATH = _CFG.get("resflow_path", "checkpoints/resflow.safetensors")
+VAE_PATH = _CFG.get("vae_path", "ckpts/stable-diffusion-2-1-base")
+RESFLOW_PATH = _CFG.get("resflow_path", "ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors")
 MODEL_CONFIG = _CFG.get("model_config", "configs/resflow.yaml")
 FLOW_SIGMA = _CFG.get("flow_sigma", 1.0)
 INFER_STEPS = _CFG.get("steps", 28)
@@ -80,21 +77,31 @@ class ResFlowInferencer:
     # ---- 模型加载 ----
 
     def load(self):
-        """加载 VAE + ResFlow + DINOv2。"""
-        print(f"Loading VAE '{MODEL_NAME}' -> {DENOISE_DEVICE}...")
-        self.ae = load_ae(MODEL_NAME, device=DENOISE_DEVICE)
-        self.ae.eval()
+        """加载 SD2.1 VAE + ResFlow + DINOv2。"""
+        from diffusers import AutoencoderKL
+
+        print(f"Loading SD2.1 VAE from {VAE_PATH} -> {DENOISE_DEVICE}...")
+        self.ae = AutoencoderKL.from_pretrained(VAE_PATH, subfolder="vae")
+        self.ae = self.ae.to(DENOISE_DEVICE).eval()
         self.ae.requires_grad_(False)
+        print(f"  VAE scaling_factor: {self.ae.config.scaling_factor}")
 
         print(f"Loading ResFlow from {RESFLOW_PATH} ...")
         self.resflow = create_resflow(MODEL_CONFIG)
         sd = safe_load(RESFLOW_PATH)
-        self.resflow.load_state_dict(sd, strict=True)
+        # VOSR checkpoint: raw DiT params (no prefix) → ResFlow expects "dit." prefix
+        sd.pop("ema_scale", None)
+        sd = {"dit." + k if not k.startswith("dit.") else k: v for k, v in sd.items()}
+        missing, unexpected = self.resflow.load_state_dict(sd, strict=False)
         self.resflow = self.resflow.to(DENOISE_DEVICE, dtype=torch.float32)
         self.resflow.eval()
-        self.resflow.dit.use_checkpoint = False  # 推理不需要梯度检查点
+        self.resflow.dit.use_checkpoint = False
         n = sum(p.numel() for p in self.resflow.parameters()) / 1e6
         print(f"  Params: {n:.2f}M")
+        if missing:
+            print(f"  Missing keys: {missing}")
+        if unexpected:
+            print(f"  Unexpected keys: {unexpected}")
 
         print(f"Loading DINOv2 encoder ...")
         self.venc = create_dinov2_encoder(MODEL_CONFIG, device=DENOISE_DEVICE)
@@ -106,15 +113,13 @@ class ResFlowInferencer:
     # ---- VAE 编解码 ----
 
     def vae_encode(self, img: torch.Tensor) -> torch.Tensor:
-        """[-1,1] bf16 → latent [B,16,H,W]."""
-        return self.ae.encode(img.to(DENOISE_DEVICE, dtype=torch.bfloat16))
+        """img [-1,1] → SD2.1 latent [B,4,H,W] (scaled)."""
+        return self.ae.encode(img.float()).latent_dist.sample() * self.ae.config.scaling_factor
 
     def vae_decode(self, latent: torch.Tensor) -> torch.Tensor:
-        """latent [B,16,H,W] → pixel [0,1]."""
-        latent = latent.to(DENOISE_DEVICE)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            img = self.ae.decode(latent)
-        img = img.float()
+        """SD2.1 latent [B,4,H,W] (scaled) → pixel [0,1]."""
+        latent = latent / self.ae.config.scaling_factor
+        img = self.ae.decode(latent).sample
         return torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
 
     # ---- Tile 辅助 ----
@@ -297,7 +302,7 @@ class ResFlowInferencer:
         # ---- LR 像素空间 (供 DINOv2 使用) ----
         lr_pixel = None
         if self.venc is not None:
-            lr_pixel = (im_cond + 1.0) / 2.0   # [-1,1] bf16 → [0,1]
+            lr_pixel = im_cond.float()  
 
         # ---- tile 参数 ----
         lt_size = max((_tile_size // AE_FACTOR // PATCH_SIZE) * PATCH_SIZE, PATCH_SIZE)

@@ -1,6 +1,6 @@
 """
-Lightning DiT — self-contained version for flux_sr.
-Based on VOSR/lightningdit.py, with PatchEmbed inlined (no timm dependency).
+Lightning DiT — for flux_sr.
+Based on VOSR/lightningdit.py, with timm dependency (matching VOSR).
 
 Original credits:
   Built from DiT & SiT (https://github.com/facebookresearch/DiT; https://github.com/willisma/SiT)
@@ -12,56 +12,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from timm.models.vision_transformer import PatchEmbed, Mlp
 
 from .swiglu_ffn import SwiGLUFFN
 from .pos_embed import VisionRotaryEmbeddingFast
 from .rmsnorm import RMSNorm
-
-
-# ------------------------------------------------------------------
-# Self-contained PatchEmbed (replaces timm.models.vision_transformer.PatchEmbed)
-# ------------------------------------------------------------------
-class PatchEmbed(nn.Module):
-    """2D Image to Patch Embedding."""
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, bias=True, strict_img_size=False):
-        super().__init__()
-        if isinstance(img_size, int):
-            img_size = (img_size, img_size)
-        if isinstance(patch_size, int):
-            patch_size = (patch_size, patch_size)
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias)
-
-    def forward(self, x):
-        x = self.proj(x)                        # (B, E, H/p, W/p)
-        x = x.flatten(2).transpose(1, 2)         # (B, N, E)
-        return x
-
-
-# ------------------------------------------------------------------
-# Self-contained Mlp (replaces timm.models.vision_transformer.Mlp)
-# ------------------------------------------------------------------
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
 
 
 # ------------------------------------------------------------------
@@ -381,7 +336,7 @@ class LightningDiT(nn.Module):
         self.depth = depth
         self.hidden_size = hidden_size
         self.use_checkpoint = use_checkpoint
-        self.x_embedder = PatchEmbed(input_size, patch_size, self.in_channels, hidden_size, bias=True, strict_img_size=False)
+        self.x_embedder = PatchEmbed(input_size, patch_size, self.in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
 
         if self.use_rope:

@@ -1,10 +1,10 @@
-# ResFlow 推理配置 — Residual Flow Matching 逆流积分 (不含 Flux)
+# ResFlow 推理配置 — Residual Flow Matching 逆流积分 (SD2.1 VAE)
 
-# VAE 模型名称 (用于编解码)
-model_name: flux-dev
+# SD2.1 VAE 路径
+vae_path: ckpts/stable-diffusion-2-1-base
 
-# ResFlow 权重路径
-resflow_path: checkpoints/resflow.safetensors
+# ResFlow / VOSR 权重路径
+resflow_path: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
 
 # DiT 架构配置 (与训练一致)
 model_config: configs/resflow.yaml
@@ -13,7 +13,7 @@ model_config: configs/resflow.yaml
 flow_sigma: 1.0
 
 # 逆流积分步数 (t: 1.0 → 0.0)
-steps: 10
+steps: 15
 
 # 放大倍数 (输出尺寸 = 原图 × scale)
 scale: 4.0

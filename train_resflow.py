@@ -1,5 +1,5 @@
 """
-ResFlow 训练脚本 — LightningDiT 速度预测
+ResFlow 训练脚本 — LightningDiT 速度预测 (SD2.1 VAE)
 
 训练目标: ResFlow 学习 Residual Flow Matching — 从 LR→HR 的残差流。
 
@@ -7,19 +7,17 @@ Residual Flow 路径: t=0 → HR latent, t=1 → z_lr + σ·ε
   x_t = z_hr + t·(z_lr - z_hr) + t·σ·ε
   v_gt = (z_lr - z_hr) + σ·ε
 
-架构 (LightningDiT, ~0.35B):
-  cat(z_lr[16ch], x_t[16ch]) → [B, 32, H, W]
+架构 (LightningDiT, ~0.5B):
+  cat(z_lr[4ch], x_t[4ch]) → [B, 8, H, W]
     → PatchEmbed(patch=2) → tokens
     → 28× LightningDiTBlock (Self-Attn + Cross-Attn(DINOv2) + SwiGLU + AdaLN)
-    → unpatchify → v [16ch]
+    → unpatchify → v [4ch]
 
 用法:
   python train_resflow.py
 """
 
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["HF_HOME"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
 import argparse
 import random
 from collections import OrderedDict
@@ -31,11 +29,11 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch.amp import autocast
-from safetensors.torch import save_file as safe_save
+from safetensors.torch import save_file as safe_save, load_file as safe_load
 from tqdm import tqdm
 
+from diffusers import AutoencoderKL
 from datapipe.train_dataloader import create_train_dataloader
-from flux.util import load_ae
 from models.resflow import create_resflow
 from models.dinov2_encoder import create_dinov2_encoder
 
@@ -58,7 +56,7 @@ class ResFlowTrainer:
         with open(config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
 
-        self.device = torch.device(self.cfg["flux"]["denoise_device"])
+        self.device = torch.device(self.cfg["denoise_device"])
         self._setup_seed(self.cfg["training"]["seed"])
 
         # Residual Flow Matching
@@ -110,16 +108,15 @@ class ResFlowTrainer:
         torch.cuda.manual_seed_all(seed)
 
     def _load_vae(self):
-        """只加载 VAE 编解码器（训练不需要 Flux DiT / T5 / CLIP）。"""
-        flux_cfg = self.cfg["flux"]
-        name = flux_cfg["model_name"]
+        """加载 SD2.1 VAE 编解码器（冻结）。"""
+        vae_path = self.cfg["vae_path"]
         device = self.device
 
-        print(f"Loading VAE '{name}' -> {device} ...")
-        self.ae = load_ae(name, device=device)
-        self.ae.eval()
+        print(f"Loading SD2.1 VAE from {vae_path} -> {device} ...")
+        self.ae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae")
+        self.ae = self.ae.to(device).eval()
         self.ae.requires_grad_(False)
-        print("✅ VAE loaded.")
+        print(f"✅ VAE loaded, scaling_factor={self.ae.config.scaling_factor}")
 
     def _load_dinov2(self):
         """加载冻结的 DINOv2 语义编码器。"""
@@ -137,6 +134,21 @@ class ResFlowTrainer:
         self.resflow = create_resflow(cfg_path).to(self.device)
         n_params = sum(p.numel() for p in self.resflow.parameters())
         print(f"✅ ResFlow: {n_params / 1e6:.1f}M params")
+
+        # 从 VOSR checkpoint 加载预训练权重
+        pretrained = self.cfg.get("pretrained_path", "")
+        if pretrained and os.path.exists(pretrained):
+            print(f"Loading pretrained weights from {pretrained} ...")
+            sd = safe_load(pretrained)
+            sd.pop("ema_scale", None)
+            # VOSR checkpoint: raw DiT params (no prefix) → ResFlow expects "dit." prefix
+            sd = {"dit." + k if not k.startswith("dit.") else k: v for k, v in sd.items()}
+            missing, unexpected = self.resflow.load_state_dict(sd, strict=False)
+            if missing:
+                print(f"  Missing keys: {len(missing)}")
+            if unexpected:
+                print(f"  Unexpected keys: {len(unexpected)}")
+            print(f"✅ Pretrained weights loaded.")
 
     def _build_optimizer(self):
         tcfg = self.cfg["training"]
@@ -213,10 +225,10 @@ class ResFlowTrainer:
 
     @torch.no_grad()
     def vae_encode(self, img: torch.Tensor) -> torch.Tensor:
-        """[B,3,H,W] float [0,1] → [B,16,H/8,W/8] latent."""
+        """[B,3,H,W] float [0,1] → [B,4,H/8,W/8] SD2.1 latent (scaled)."""
         img = img.to(device=self.device, dtype=torch.bfloat16)
         img = img * 2.0 - 1.0
-        return self.ae.encode(img)
+        return self.ae.encode(img.float()).latent_dist.sample() * self.ae.config.scaling_factor
 
     # ------------------------------------------------------------------
     # Training step
@@ -229,9 +241,9 @@ class ResFlowTrainer:
         lr = batch["lq"].to(device)      # [B, 3, H, W]  [0, 1]
 
         # 1. VAE encode
-        z_hr = self.vae_encode(hr)       # [B, 16, H/8, W/8]
+        z_hr = self.vae_encode(hr)       # [B, 4, H/8, W/8]
         lr_up = F.interpolate(lr, size=hr.shape[-2:], mode="bicubic", align_corners=False)
-        z_lr = self.vae_encode(lr_up)    # [B, 16, H/8, W/8]
+        z_lr = self.vae_encode(lr_up)    # [B, 4, H/8, W/8]
 
         z_hr = z_hr.detach().float()
         z_lr = z_lr.detach().float()

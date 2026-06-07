@@ -1,19 +1,19 @@
 """
-ResFlow — Residual Flow Matching DiT
+ResFlow — Residual Flow Matching DiT (SD2.1 VAE 潜空间)
 
 输入:
-  z_lr [B, 16, H, W]   LR latent (VAE encode 上采样 LR)
-  x_t  [B, 16, H, W]   当前流状态
+  z_lr [B, 4, H, W]    LR latent (VAE encode 上采样 LR)
+  x_t  [B, 4, H, W]    当前流状态
   t    [B]              时间 ∈ [0,1]
 
 输出:
-  v    [B, 16, H, W]    速度预测
+  v    [B, 4, H, W]     速度预测
 
 架构:
-  cat(z_lr, x_t) → [B, 32, H, W]
+  cat(z_lr, x_t) → [B, 8, H, W]
     → PatchEmbed(patch_size=2) → tokens [B, N, 1024]
     → LightningDiT × 28 blocks
-    → unpatchify → [B, 16, H, W]
+    → unpatchify → [B, 4, H, W]
 """
 
 import torch
@@ -28,8 +28,8 @@ class ResFlow(nn.Module):
         self,
         input_size: int = 64,
         patch_size: int = 2,
-        in_channels: int = 32,
-        out_channels: int = 16,
+        in_channels: int = 8,
+        out_channels: int = 4,
         hidden_size: int = 1024,
         depth: int = 28,
         num_heads: int = 16,
@@ -73,15 +73,15 @@ class ResFlow(nn.Module):
                 venc_fea=None) -> torch.Tensor:
         """
         Args:
-            x_t:  [B, 16, H, W]  当前流状态
+            x_t:  [B, 4, H, W]   当前流状态
             t:    [B]             时间
-            z_lr: [B, 16, H, W]  LR latent（channel-concat 条件）
+            z_lr: [B, 4, H, W]   LR latent（channel-concat 条件）
             venc_fea: DINOv2 特征列表 [tensor[B,N,C]] 或 None（Cross-Attn 条件）
 
         Returns:
-            v:    [B, 16, H, W]  速度预测
+            v:    [B, 4, H, W]   速度预测
         """
-        inp = torch.cat([z_lr, x_t], dim=1)  # [B, 32, H, W]
+        inp = torch.cat([z_lr, x_t], dim=1)  # [B, 8, H, W]
         return self.dit.forward_flexible(inp, t, z=venc_fea)
 
 
@@ -100,8 +100,8 @@ def create_resflow(cfg_path: str) -> ResFlow:
     return ResFlow(
         input_size=arch.get("input_size", 64),
         patch_size=arch.get("patch_size", 2),
-        in_channels=arch.get("in_channels", 32),
-        out_channels=arch.get("out_channels", 16),
+        in_channels=arch.get("in_channels", 8),
+        out_channels=arch.get("out_channels", 4),
         hidden_size=arch.get("hidden_size", 1024),
         depth=arch.get("depth", 28),
         num_heads=arch.get("num_heads", 16),
