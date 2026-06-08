@@ -4,7 +4,7 @@ DINOv2 编码器 — 冻结，从 LR 图片提取语义特征注入 DiT Cross-At
 使用 torch.hub 下载权重（与 VOSR 一致），缓存至 ckpts/torch_cache。
 
 用法:
-    encoder = create_dinov2_encoder("configs/resflow.yaml", device="cuda")
+    encoder = create_dinov2_encoder("configs/rfmsr.yaml", device="cuda")
     features = encoder(lr_tensor)  # lr: [B,3,H,W] float [0,1] → list[[B,N,enc_dim]]
 """
 

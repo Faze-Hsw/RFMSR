@@ -1,7 +1,7 @@
-# ResFlow 训练配置 — LightningDiT (VOSR-style, ~0.5B)
+# RFMSR 训练配置 — LightningDiT (VOSR-style, ~0.5B)
 
 # ---- 模型架构（引用外部配置） ----
-model_config: configs/resflow.yaml
+model_config: configs/rfmsr.yaml
 
 # ---- 预训练权重（从 VOSR checkpoint 初始化） ----
 pretrained_path: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
@@ -48,8 +48,8 @@ flow:
 
 # ---- 日志 & 保存 ----
 experiment:
-  name: resflow
-  save_dir: experiments/resflow
+  name: rfmsr
+  save_dir: experiments/rfmsr
   log_freq: 1000
   save_freq: 1000
   keep_last_n: 3

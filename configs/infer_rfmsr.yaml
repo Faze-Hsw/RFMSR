@@ -1,13 +1,13 @@
-# ResFlow 推理配置 — Residual Flow Matching 逆流积分 (SD2.1 VAE)
+# RFMSR 推理配置 — Residual Flow Matching 逆流积分 (SD2.1 VAE)
 
 # SD2.1 VAE 路径
 vae_path: ckpts/stable-diffusion-2-1-base
 
-# ResFlow / VOSR 权重路径
-resflow_path: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
+# RFMSR / VOSR 权重路径
+rfmsr_path: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
 
 # DiT 架构配置 (与训练一致)
-model_config: configs/resflow.yaml
+model_config: configs/rfmsr.yaml
 
 # Residual FM 噪声标准差
 flow_sigma: 1.0

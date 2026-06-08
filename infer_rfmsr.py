@@ -1,12 +1,12 @@
 """
-ResFlow 推理脚本 — Residual Flow Matching 逆流积分 (SD2.1 VAE)
+RFMSR 推理脚本 — Residual Flow Matching 逆流积分 (SD2.1 VAE)
 
-使用 ResFlow (LightningDiT) 做速度预测，SD2.1 VAE 编解码。
+使用 RFMSR (LightningDiT) 做速度预测，SD2.1 VAE 编解码。
 流路径: x_t = z_hr + t·(z_lr - z_hr) + t·σ·ε
 逆流积分: t=1(LR+noise) → t=0(HR)
 
 用法:
-  python infer_resflow.py --input input.png
+  python infer_rfmsr.py --input input.png
 """
 
 import os
@@ -24,7 +24,7 @@ from einops import rearrange, repeat
 from tqdm import tqdm
 
 from safetensors.torch import load_file as safe_load
-from models.resflow import create_resflow
+from models.rfmsr import create_rfmsr
 from models.dinov2_encoder import create_dinov2_encoder
 from utils.color_fix import apply_color_fix
 
@@ -34,7 +34,7 @@ from utils.color_fix import apply_color_fix
 # ================================================================================
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "infer_resflow.yaml")
+_CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "infer_rfmsr.yaml")
 
 
 def load_config() -> dict:
@@ -48,8 +48,8 @@ def load_config() -> dict:
 _CFG = load_config()
 
 VAE_PATH = _CFG.get("vae_path", "ckpts/stable-diffusion-2-1-base")
-RESFLOW_PATH = _CFG.get("resflow_path", "ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors")
-MODEL_CONFIG = _CFG.get("model_config", "configs/resflow.yaml")
+RFMSR_PATH = _CFG.get("rfmsr_path", "ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors")
+MODEL_CONFIG = _CFG.get("model_config", "configs/rfmsr.yaml")
 FLOW_SIGMA = _CFG.get("flow_sigma", 1.0)
 INFER_STEPS = _CFG.get("steps", 28)
 SCALE = _CFG.get("scale", 4.0)
@@ -66,10 +66,10 @@ COLOR_CORRECTION = _CFG.get("color_correction", "none")
 
 
 # ================================================================================
-# ResFlow 推理器
+# RFMSR 推理器
 # ================================================================================
 
-class ResFlowInferencer:
+class RFMSRInferencer:
 
     def __init__(self):
         pass
@@ -77,7 +77,7 @@ class ResFlowInferencer:
     # ---- 模型加载 ----
 
     def load(self):
-        """加载 SD2.1 VAE + ResFlow + DINOv2。"""
+        """加载 SD2.1 VAE + RFMSR + DINOv2。"""
         from diffusers import AutoencoderKL
 
         print(f"Loading SD2.1 VAE from {VAE_PATH} -> {DENOISE_DEVICE}...")
@@ -86,17 +86,17 @@ class ResFlowInferencer:
         self.ae.requires_grad_(False)
         print(f"  VAE scaling_factor: {self.ae.config.scaling_factor}")
 
-        print(f"Loading ResFlow from {RESFLOW_PATH} ...")
-        self.resflow = create_resflow(MODEL_CONFIG)
-        sd = safe_load(RESFLOW_PATH)
-        # VOSR checkpoint: raw DiT params (no prefix) → ResFlow expects "dit." prefix
+        print(f"Loading RFMSR from {RFMSR_PATH} ...")
+        self.rfmsr = create_rfmsr(MODEL_CONFIG)
+        sd = safe_load(RFMSR_PATH)
+        # VOSR checkpoint: raw DiT params (no prefix) → RFMSR expects "dit." prefix
         sd.pop("ema_scale", None)
         sd = {"dit." + k if not k.startswith("dit.") else k: v for k, v in sd.items()}
-        missing, unexpected = self.resflow.load_state_dict(sd, strict=False)
-        self.resflow = self.resflow.to(DENOISE_DEVICE, dtype=torch.float32)
-        self.resflow.eval()
-        self.resflow.dit.use_checkpoint = False
-        n = sum(p.numel() for p in self.resflow.parameters()) / 1e6
+        missing, unexpected = self.rfmsr.load_state_dict(sd, strict=False)
+        self.rfmsr = self.rfmsr.to(DENOISE_DEVICE, dtype=torch.float32)
+        self.rfmsr.eval()
+        self.rfmsr.dit.use_checkpoint = False
+        n = sum(p.numel() for p in self.rfmsr.parameters()) / 1e6
         print(f"  Params: {n:.2f}M")
         if missing:
             print(f"  Missing keys: {missing}")
@@ -158,7 +158,7 @@ class ResFlowInferencer:
     def reverse_flow(self, z_lr: torch.Tensor, steps: int = 28,
                      flow_sigma: float = None, seed: int = 42,
                      lr_pixel=None) -> torch.Tensor:
-        """ResFlow 逆流积分: t=1 → t=0."""
+        """RFMSR 逆流积分: t=1 → t=0."""
         device = z_lr.device
         B, C, H, W = z_lr.shape
         _sigma = flow_sigma if flow_sigma is not None else FLOW_SIGMA
@@ -177,12 +177,12 @@ class ResFlowInferencer:
 
         step_pairs = list(zip(timesteps[:-1], timesteps[1:]))
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            for t_curr, t_prev in tqdm(step_pairs, desc="ResFlow",
+            for t_curr, t_prev in tqdm(step_pairs, desc="RFMSR",
                                         total=len(step_pairs), leave=False):
                 t_batch = torch.full((B,), t_curr, device=device)
                 dt = t_prev - t_curr
 
-                v = self.resflow(x, t_batch, z_lr, venc_fea=venc_fea).float()
+                v = self.rfmsr(x, t_batch, z_lr, venc_fea=venc_fea).float()
                 x = x + dt * v
 
         return x
@@ -228,7 +228,7 @@ class ResFlowInferencer:
         g_weight = self._gaussian_weights(lt_size, lt_size, C, device)
 
         step_pairs = list(zip(timesteps[:-1], timesteps[1:]))
-        for t_curr, t_prev in tqdm(step_pairs, desc="Tiled ResFlow",
+        for t_curr, t_prev in tqdm(step_pairs, desc="Tiled RFMSR",
                                     total=len(step_pairs), leave=False):
             t_batch = torch.full((B,), t_curr, device=device)
             dt = t_prev - t_curr
@@ -243,7 +243,7 @@ class ResFlowInferencer:
                     tile_fea = tile_venc.get((hs, ws), None) if use_venc else None
 
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        v_tile = self.resflow(
+                        v_tile = self.rfmsr(
                             x_tile, t_batch, z_lr_tile, venc_fea=tile_fea
                         ).float()
 
@@ -261,7 +261,7 @@ class ResFlowInferencer:
               flow_sigma: float = None, seed: int = SEED,
               chopping: bool = None, tile_size: int = None,
               tile_stride: int = None, color_correction: str = 'none') -> Image.Image:
-        """输入图片 → ResFlow 超分 → 输出图片。
+        """输入图片 → RFMSR 超分 → 输出图片。
 
         Args:
             color_correction: 颜色校正方法 ('adain', 'wavelet', 'ycbcr', 'none').
@@ -354,7 +354,7 @@ def main(
     tile_stride: int = None,
     color_correction: str = COLOR_CORRECTION,
 ):
-    """ResFlow Residual Flow Matching 超分推理。
+    """RFMSR Residual Flow Matching 超分推理。
 
     Args:
         input:        输入图片或文件夹路径 (必填)
@@ -390,7 +390,7 @@ def main(
         img_files = [init_image]
 
     print(f"\n{'=' * 50}")
-    print(f"ResFlow Residual FM Inference")
+    print(f"RFMSR Residual FM Inference")
     print(f"  Input:    {init_image}")
     if src_path.is_dir():
         print(f"  Images:   {len(img_files)}")
@@ -403,7 +403,7 @@ def main(
     print(f"  Output:   {output}")
     print(f"{'=' * 50}\n")
 
-    inferencer = ResFlowInferencer()
+    inferencer = RFMSRInferencer()
     inferencer.load()
 
     out_root = Path(output)

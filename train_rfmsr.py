@@ -1,7 +1,7 @@
 """
-ResFlow 训练脚本 — LightningDiT 速度预测 (SD2.1 VAE)
+RFMSR 训练脚本 — LightningDiT 速度预测 (SD2.1 VAE)
 
-训练目标: ResFlow 学习 Residual Flow Matching — 从 LR→HR 的残差流。
+训练目标: RFMSR 学习 Residual Flow Matching — 从 LR→HR 的残差流。
 
 Residual Flow 路径: t=0 → HR latent, t=1 → z_lr + σ·ε
   x_t = z_hr + t·(z_lr - z_hr) + t·σ·ε
@@ -14,7 +14,7 @@ Residual Flow 路径: t=0 → HR latent, t=1 → z_lr + σ·ε
     → unpatchify → v [4ch]
 
 用法:
-  python train_resflow.py
+  python train_rfmsr.py
 """
 
 import os
@@ -34,7 +34,7 @@ from tqdm import tqdm
 
 from diffusers import AutoencoderKL
 from datapipe.train_dataloader import create_train_dataloader
-from models.resflow import create_resflow
+from models.rfmsr import create_rfmsr
 from models.dinov2_encoder import create_dinov2_encoder
 
 # CUDA 优化
@@ -48,11 +48,11 @@ torch.backends.cudnn.benchmark = True
 # Trainer
 # =========================================================================
 
-class ResFlowTrainer:
+class RFMSRTrainer:
 
     def __init__(self):
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(_script_dir, "configs", "train_resflow.yaml")
+        config_path = os.path.join(_script_dir, "configs", "train_rfmsr.yaml")
         with open(config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
 
@@ -78,7 +78,7 @@ class ResFlowTrainer:
         # ---- 加载模块 ----
         self._load_vae()
         self._load_dinov2()
-        self._build_resflow()
+        self._build_rfmsr()
         self._build_optimizer()
         self._build_dataloader()
         self._build_ema()
@@ -129,11 +129,11 @@ class ResFlowTrainer:
         else:
             self.venc = None
 
-    def _build_resflow(self):
+    def _build_rfmsr(self):
         cfg_path = self.cfg["model_config"]
-        self.resflow = create_resflow(cfg_path).to(self.device)
-        n_params = sum(p.numel() for p in self.resflow.parameters())
-        print(f"✅ ResFlow: {n_params / 1e6:.1f}M params")
+        self.rfmsr = create_rfmsr(cfg_path).to(self.device)
+        n_params = sum(p.numel() for p in self.rfmsr.parameters())
+        print(f"✅ RFMSR: {n_params / 1e6:.1f}M params")
 
         # 从 VOSR checkpoint 加载预训练权重
         pretrained = self.cfg.get("pretrained_path", "")
@@ -141,9 +141,9 @@ class ResFlowTrainer:
             print(f"Loading pretrained weights from {pretrained} ...")
             sd = safe_load(pretrained)
             sd.pop("ema_scale", None)
-            # VOSR checkpoint: raw DiT params (no prefix) → ResFlow expects "dit." prefix
+            # VOSR checkpoint: raw DiT params (no prefix) → RFMSR expects "dit." prefix
             sd = {"dit." + k if not k.startswith("dit.") else k: v for k, v in sd.items()}
-            missing, unexpected = self.resflow.load_state_dict(sd, strict=False)
+            missing, unexpected = self.rfmsr.load_state_dict(sd, strict=False)
             if missing:
                 print(f"  Missing keys: {len(missing)}")
             if unexpected:
@@ -153,7 +153,7 @@ class ResFlowTrainer:
     def _build_optimizer(self):
         tcfg = self.cfg["training"]
         self.optimizer = torch.optim.AdamW(
-            self.resflow.parameters(),
+            self.rfmsr.parameters(),
             lr=tcfg["lr"],
             betas=(tcfg["adam_beta1"], tcfg["adam_beta2"]),
             weight_decay=tcfg["adam_weight_decay"],
@@ -180,7 +180,7 @@ class ResFlowTrainer:
         if rate > 0:
             self.ema_rate = rate
             self.ema_state = OrderedDict(
-                {k: deepcopy(v.data) for k, v in self.resflow.state_dict().items()}
+                {k: deepcopy(v.data) for k, v in self.rfmsr.state_dict().items()}
             )
         else:
             self.ema_rate = 0
@@ -262,11 +262,11 @@ class ResFlowTrainer:
         x_t = z_hr + t_expand * residual + t_expand * self.sigma * epsilon
         v_gt = residual + self.sigma * epsilon
 
-        # 4. ResFlow + Loss (bf16 autocast)
+        # 4. RFMSR + Loss (bf16 autocast)
         #    梯度累计时 loss 需要 / accumulation_steps，保证有效梯度不变
         loss_scale = 1.0 / self.accumulation_steps
         with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
-            v_super = self.resflow(x_t, t, z_lr, venc_fea=venc_fea)
+            v_super = self.rfmsr(x_t, t, z_lr, venc_fea=venc_fea)
             loss = F.mse_loss(v_super, v_gt) * loss_scale
 
         losses = {"velo": loss.item() * self.accumulation_steps}  # 上报原始 scale
@@ -284,7 +284,7 @@ class ResFlowTrainer:
     def _update_ema(self):
         if self.ema_state is None:
             return
-        for k, v in self.resflow.state_dict().items():
+        for k, v in self.rfmsr.state_dict().items():
             if v.is_floating_point():
                 self.ema_state[k].mul_(self.ema_rate).add_(v.data, alpha=1 - self.ema_rate)
             else:
@@ -299,14 +299,14 @@ class ResFlowTrainer:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         # 推理权重 (safetensors)
-        weights = self.ema_state if self.ema_state is not None else self.resflow.state_dict()
-        ema_path = ckpt_dir / f"resflow_step{step}.safetensors"
+        weights = self.ema_state if self.ema_state is not None else self.rfmsr.state_dict()
+        ema_path = ckpt_dir / f"rfmsr_step{step}.safetensors"
         safe_save(weights, ema_path)
 
         # 完整训练状态 (torch.save)
         state = {
             "step": step,
-            "resflow": self.resflow.state_dict(),
+            "rfmsr": self.rfmsr.state_dict(),
             "ema_state": self.ema_state,
             "optimizer": self.optimizer.state_dict(),
         }
@@ -322,7 +322,7 @@ class ResFlowTrainer:
         """只保留最近 N 个检查点，删除其余。"""
         import re
         # 收集所有检查点文件，按 step 分组
-        pattern = re.compile(r"(resflow_step|training_state_step)(\d+)")
+        pattern = re.compile(r"(rfmsr_step|training_state_step)(\d+)")
         ckpt_steps: dict[int, list[Path]] = {}
         for f in ckpt_dir.iterdir():
             m = pattern.match(f.name)
@@ -339,7 +339,7 @@ class ResFlowTrainer:
 
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
-        self.resflow.load_state_dict(ckpt["resflow"])
+        self.rfmsr.load_state_dict(ckpt["rfmsr"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
         # overrides the old hyperparameters in the checkpoint with the current config
         tcfg = self.cfg["training"]
@@ -362,7 +362,7 @@ class ResFlowTrainer:
         total_iters = tcfg["iterations"]
         grad_clip = tcfg["gradient_clip"]
         accum_steps = self.accumulation_steps
-        self.resflow.train()
+        self.rfmsr.train()
 
         data_iter = iter(self.dataloader)
         pbar = tqdm(
@@ -400,7 +400,7 @@ class ResFlowTrainer:
                 if self.accumulation_count >= accum_steps:
                     # 梯度裁剪
                     if grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(self.resflow.parameters(), grad_clip)
+                        torch.nn.utils.clip_grad_norm_(self.rfmsr.parameters(), grad_clip)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
 
@@ -441,11 +441,11 @@ class ResFlowTrainer:
 # =========================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train ResFlow (LightningDiT)")
+    parser = argparse.ArgumentParser(description="Train RFMSR (LightningDiT)")
     parser.add_argument("--resume", type=str, default=None, help="Path to training state checkpoint")
     args = parser.parse_args()
 
-    trainer = ResFlowTrainer()
+    trainer = RFMSRTrainer()
     if args.resume:
         trainer.load_checkpoint(args.resume)
     trainer.train()

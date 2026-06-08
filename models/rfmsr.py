@@ -1,5 +1,5 @@
 """
-ResFlow — Residual Flow Matching DiT (SD2.1 VAE 潜空间)
+RFMSR — Residual Flow Matching DiT (SD2.1 VAE 潜空间)
 
 输入:
   z_lr [B, 4, H, W]    LR latent (VAE encode 上采样 LR)
@@ -23,7 +23,7 @@ import yaml
 from .lightningdit import LightningDiT
 
 
-class ResFlow(nn.Module):
+class RFMSR(nn.Module):
     def __init__(
         self,
         input_size: int = 64,
@@ -85,8 +85,8 @@ class ResFlow(nn.Module):
         return self.dit.forward_flexible(inp, t, z=venc_fea)
 
 
-def create_resflow(cfg_path: str) -> ResFlow:
-    """从 YAML 配置文件创建 ResFlow。"""
+def create_rfmsr(cfg_path: str) -> RFMSR:
+    """从 YAML 配置文件创建 RFMSR。"""
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -97,7 +97,7 @@ def create_resflow(cfg_path: str) -> ResFlow:
     num_fused_layers = len(dv2.get("layer_dinov2b_list", [1]))
     encdim_ratio = dv2.get("encdim_ratio", 2)
 
-    return ResFlow(
+    return RFMSR(
         input_size=arch.get("input_size", 64),
         patch_size=arch.get("patch_size", 2),
         in_channels=arch.get("in_channels", 8),

@@ -1,4 +1,4 @@
-# ResFlow — LightningDiT 架构超参数（SD2.1 VAE 潜空间）
+# RFMSR — LightningDiT 架构超参数（SD2.1 VAE 潜空间）
 # 输入: cat(z_lr[4ch], x_t[4ch]) → [B, 8, H, W]
 # 输出: v [4ch] (速度预测)
 

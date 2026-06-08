@@ -1,1 +1,1 @@
-from .resflow import ResFlow, create_resflow
+from .rfmsr import RFMSR, create_rfmsr
