@@ -3,9 +3,6 @@
 # ---- 模型架构（引用外部配置） ----
 model_config: configs/rfmsr.yaml
 
-# ---- 预训练权重（从 VOSR checkpoint 初始化） ----
-pretrained_path: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
-
 # ---- 数据 ----
 data:
   hr_dir: traindata/

@@ -3,7 +3,7 @@
 # SD2.1 VAE 路径
 vae_path: ckpts/stable-diffusion-2-1-base
 
-# RFMSR / VOSR 权重路径
+# RFMSR 路径
 rfmsr_path: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
 
 # DiT 架构配置 (与训练一致)

@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch.amp import autocast
-from safetensors.torch import save_file as safe_save, load_file as safe_load
+from safetensors.torch import save_file as safe_save
 from tqdm import tqdm
 
 from diffusers import AutoencoderKL
@@ -134,21 +134,6 @@ class RFMSRTrainer:
         self.rfmsr = create_rfmsr(cfg_path).to(self.device)
         n_params = sum(p.numel() for p in self.rfmsr.parameters())
         print(f"✅ RFMSR: {n_params / 1e6:.1f}M params")
-
-        # 从 VOSR checkpoint 加载预训练权重
-        pretrained = self.cfg.get("pretrained_path", "")
-        if pretrained and os.path.exists(pretrained):
-            print(f"Loading pretrained weights from {pretrained} ...")
-            sd = safe_load(pretrained)
-            sd.pop("ema_scale", None)
-            # VOSR checkpoint: raw DiT params (no prefix) → RFMSR expects "dit." prefix
-            sd = {"dit." + k if not k.startswith("dit.") else k: v for k, v in sd.items()}
-            missing, unexpected = self.rfmsr.load_state_dict(sd, strict=False)
-            if missing:
-                print(f"  Missing keys: {len(missing)}")
-            if unexpected:
-                print(f"  Unexpected keys: {len(unexpected)}")
-            print(f"✅ Pretrained weights loaded.")
 
     def _build_optimizer(self):
         tcfg = self.cfg["training"]
