@@ -7,10 +7,10 @@ Residual Flow 路径: t=0 → HR latent, t=1 → z_lr + σ·ε
   x_t = z_hr + t·(z_lr - z_hr) + t·σ·ε
   v_gt = (z_lr - z_hr) + σ·ε
 
-架构 (LightningDiT, ~0.5B):
+架构 (LightningDiT):
   cat(z_lr[4ch], x_t[4ch]) → [B, 8, H, W]
     → PatchEmbed(patch=2) → tokens
-    → 28× LightningDiTBlock (Self-Attn + Cross-Attn(DINOv2) + SwiGLU + AdaLN)
+    → LightningDiTBlock (Self-Attn + Cross-Attn(DINOv2) + SwiGLU + AdaLN)
     → unpatchify → v [4ch]
 
 用法:
@@ -18,6 +18,7 @@ Residual Flow 路径: t=0 → HR latent, t=1 → z_lr + σ·ε
 """
 
 import os
+import math
 import argparse
 import random
 from collections import OrderedDict
@@ -31,6 +32,7 @@ import yaml
 from torch.amp import autocast
 from safetensors.torch import save_file as safe_save
 from tqdm import tqdm
+from PIL import Image
 
 from diffusers import AutoencoderKL
 from datapipe.train_dataloader import create_train_dataloader
@@ -89,6 +91,13 @@ class RFMSRTrainer:
         # 梯度累计
         tcfg = self.cfg["training"]
         self.accumulation_steps = tcfg.get("gradient_accumulation_steps", 1)
+
+        # 验证指标
+        self.val_enabled = self.cfg.get("validation", {}).get("enabled", False)
+        self.lpips_fn = None
+        self.clipiqa_metric = None
+        if self.val_enabled:
+            self._init_val_metrics()
 
         # 训练状态
         self.global_step = 0
@@ -322,6 +331,158 @@ class RFMSRTrainer:
                 f.unlink()
             print(f"🗑️  Removed old checkpoint: step {step}")
 
+    # ------------------------------------------------------------------
+    # 验证
+    # ------------------------------------------------------------------
+
+    def _init_val_metrics(self):
+        """初始化 LPIPS 和 CLIPIQA 指标模型。"""
+        try:
+            import lpips
+            self.lpips_fn = lpips.LPIPS(net="vgg").to(self.device)
+        except ImportError:
+            print("[WARN] lpips not installed, LPIPS will be skipped")
+        try:
+            import pyiqa
+            self.clipiqa_metric = pyiqa.create_metric("clipiqa", device=self.device)
+        except ImportError:
+            print("[WARN] pyiqa not installed, CLIPIQA will be skipped")
+
+    @torch.no_grad()
+    def validate(self, step: int):
+        """验证：推理 test_lq → 计算 LPIPS/CLIPIQA → 保存 SR 图片。"""
+        self.rfmsr.eval()
+
+        # ---- EMA swap: 验证时使用 EMA 权重，与 save_checkpoint 导出的推理权重一致 ----
+        orig_state = None
+        if self.ema_state is not None:
+            orig_state = OrderedDict({k: v.data.clone() for k, v in self.rfmsr.state_dict().items()})
+            self.rfmsr.load_state_dict(self.ema_state)
+
+        val_cfg = self.cfg.get("validation", {})
+        lq_dir = Path(val_cfg.get("lq_dir", "assets/test_lq"))
+        gt_dir = Path(val_cfg.get("gt_dir", "assets/test_gt"))
+        val_steps = val_cfg.get("steps", 15)
+        val_scale = val_cfg.get("scale", 4.0)
+        val_seed = val_cfg.get("seed", 42)
+        max_images = val_cfg.get("max_images", 0)
+
+        out_dir = self.exp_dir / "validation" / f"step_{step:08d}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        SCALE = self.ae.config.scaling_factor
+        MOD_PIXEL = 16
+
+        lq_paths = sorted(lq_dir.glob("*.png"))
+        pairs = []
+        for lp in lq_paths:
+            gp = gt_dir / lp.name
+            if gp.exists():
+                pairs.append((lp, gp))
+        if max_images > 0:
+            pairs = pairs[:max_images]
+        total = len(pairs)
+        if total == 0:
+            print(f"[Val @ step {step}] No paired images found")
+            if orig_state is not None:
+                self.rfmsr.load_state_dict(orig_state)
+            self.rfmsr.train()
+            return
+
+        lpips_vals = []
+        clipiqa_vals = []
+
+        for lq_path, gt_path in tqdm(pairs, desc=f"Val@{step}", leave=False):
+            # ---- 加载 & resize LR ----
+            src = Image.open(lq_path).convert("RGB")
+            gt_img = Image.open(gt_path).convert("RGB")
+            exact_w = int(src.size[0] * val_scale)
+            exact_h = int(src.size[1] * val_scale)
+            target = src.resize((exact_w, exact_h), Image.BICUBIC)
+            ori_h, ori_w = target.size[1], target.size[0]  # PIL (w,h) → (h,w)
+
+            im_np = np.array(target).astype(np.float32) / 255.0
+            im_cond = torch.from_numpy(np.moveaxis(im_np, 2, 0)).unsqueeze(0)
+            im_cond = im_cond.to(dtype=torch.bfloat16, device=self.device)
+
+            # ---- 对齐到 16 倍数 ----
+            h, w = im_cond.shape[-2:]
+            pad_h = (math.ceil(h / MOD_PIXEL) * MOD_PIXEL) - h
+            pad_w = (math.ceil(w / MOD_PIXEL) * MOD_PIXEL) - w
+            if pad_h > 0 or pad_w > 0:
+                im_cond = F.pad(im_cond, (0, pad_w, 0, pad_h), mode="reflect")
+
+            # ---- VAE 编码 ----
+            image_tensor = im_cond * 2.0 - 1.0
+            z_lr = self.ae.encode(image_tensor.float()).latent_dist.sample() * SCALE
+
+            # ---- DINOv2 特征 ----
+            venc_fea = None
+            if self.use_dinov2 and self.venc is not None:
+                venc_fea = self.venc(im_cond.float())
+
+            # ---- 逆流积分 (t=1 → t=0) ----
+            B_v, C_v, H_v, W_v = z_lr.shape
+            timesteps = torch.linspace(1.0, 0.0, val_steps + 1, device=self.device)
+            generator = torch.Generator(device=self.device).manual_seed(val_seed)
+            x = z_lr + self.sigma * torch.randn(
+                B_v, C_v, H_v, W_v, generator=generator, device=self.device
+            )
+
+            for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+                t_batch = torch.full((B_v,), t_curr, device=self.device)
+                dt = t_prev - t_curr
+                with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
+                    v = self.rfmsr(x, t_batch, z_lr, venc_fea=venc_fea).float()
+                x = x + dt * v
+
+            # ---- VAE 解码 ----
+            latent = x / SCALE
+            sr_decoded = self.ae.decode(latent).sample
+            sr_decoded = torch.clamp((sr_decoded + 1.0) / 2.0, 0.0, 1.0)
+            sr_decoded = sr_decoded[:, :, 0:ori_h, 0:ori_w]
+
+            # ---- 保存 SR ----
+            sr_np = (sr_decoded[0].cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+            sr_np = np.moveaxis(sr_np, 0, 2)
+            Image.fromarray(sr_np).save(out_dir / lq_path.name)
+
+            # ---- LPIPS ----
+            if self.lpips_fn is not None:
+                gt_np = np.array(gt_img).astype(np.float32) / 255.0
+                gt_tensor = torch.from_numpy(np.moveaxis(gt_np, 2, 0)).unsqueeze(0)
+                gt_tensor = gt_tensor.to(self.device)
+                # LPIPS expects [-1, 1]
+                gt_norm = (gt_tensor - 0.5) / 0.5
+                sr_norm = (sr_decoded - 0.5) / 0.5
+                lpips_vals.append(self.lpips_fn(gt_norm, sr_norm).mean().item())
+
+            # ---- CLIPIQA (no-reference, 只评估 SR) ----
+            if self.clipiqa_metric is not None:
+                clipiqa_vals.append(self.clipiqa_metric(sr_decoded).mean().item())
+
+        # ---- 打印结果 ----
+        parts = []
+        if lpips_vals:
+            avg_lpips = float(np.mean(lpips_vals))
+            parts.append(f"LPIPS={avg_lpips:.4f}")
+        if clipiqa_vals:
+            avg_clipiqa = float(np.mean(clipiqa_vals))
+            parts.append(f"CLIPIQA={avg_clipiqa:.4f}")
+        parts.append(f"images={total}")
+        print(f"\n[Val @ step {step}] {', '.join(parts)}")
+        print(f"  SR saved to: {out_dir}\n")
+
+        # ---- 恢复原始权重 ----
+        if orig_state is not None:
+            self.rfmsr.load_state_dict(orig_state)
+
+        self.rfmsr.train()
+
+    # ------------------------------------------------------------------
+    # Checkpoint 续
+    # ------------------------------------------------------------------
+
     def load_checkpoint(self, path: str):
         ckpt = torch.load(path, map_location=self.device)
         self.rfmsr.load_state_dict(ckpt["rfmsr"])
@@ -410,6 +571,11 @@ class RFMSRTrainer:
 
                     if self.global_step % self.save_freq == 0:
                         self.save_checkpoint(self.global_step)
+                        if self.val_enabled:
+                            try:
+                                self.validate(self.global_step)
+                            except Exception as e:
+                                print(f"\n[WARN] Validation failed at step {self.global_step}: {e}")
 
             self.save_checkpoint(self.global_step)
             pbar.close()

@@ -7,9 +7,9 @@ dit_arch:
   patch_size: 2               # patchify 尺寸
   in_channels: 8              # z_lr(4) + x_t(4)
   out_channels: 4             # velocity output (SD2.1 latent)
-  hidden_size: 1024           # 0.5B params
-  depth: 28                   # DiT block 层数
-  num_heads: 16               # 注意力头数
+  hidden_size: 512
+  depth: 16                   # DiT block 层数
+  num_heads: 8                # 注意力头数
   mlp_ratio: 4.0              # FFN 扩展比
   use_qknorm: true            # Q/K RMSNorm
   use_swiglu: true            # SwiGLU 激活

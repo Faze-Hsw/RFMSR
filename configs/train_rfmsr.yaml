@@ -1,4 +1,4 @@
-# RFMSR 训练配置 — LightningDiT (VOSR-style, ~0.5B)
+# RFMSR 训练配置 — LightningDiT
 
 # ---- 模型架构（引用外部配置） ----
 model_config: configs/rfmsr.yaml
@@ -9,7 +9,7 @@ data:
   degradation_config: configs/realesrgan_degradation.yaml
   gt_size: 512
   batch_size: 32
-  num_workers: 12
+  num_workers: 8
   use_hflip: true
   use_rot: false
 
@@ -27,7 +27,7 @@ training:
   lr: 5.0e-5
   adam_beta1: 0.9
   adam_beta2: 0.999
-  adam_weight_decay: 0
+  adam_weight_decay: 0.01
   adam_epsilon: 1.0e-8
   gradient_accumulation_steps: 1   
   gradient_clip: 1.0
@@ -46,7 +46,17 @@ flow:
 # ---- 日志 & 保存 ----
 experiment:
   name: rfmsr
-  save_dir: experiments/rfmsr
+  save_dir: experiments
   log_freq: 1000
   save_freq: 1000
   keep_last_n: 3
+
+# ---- 验证 ----
+validation:
+  enabled: true
+  lq_dir: assets/test_lq
+  gt_dir: assets/test_gt
+  scale: 4.0
+  steps: 15               # 推理步数
+  seed: 42
+  max_images: 0           # 0 表示验证所有配对图片

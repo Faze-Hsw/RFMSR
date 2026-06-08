@@ -10,3 +10,5 @@ requests
 invisible-watermark
 basicsr>=1.4.2
 opencv-python
+lpips
+pyiqa

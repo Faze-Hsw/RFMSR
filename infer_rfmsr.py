@@ -48,7 +48,7 @@ def load_config() -> dict:
 _CFG = load_config()
 
 VAE_PATH = _CFG.get("vae_path", "ckpts/stable-diffusion-2-1-base")
-RFMSR_PATH = _CFG.get("rfmsr_path", "ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors")
+RFMSR_PATH = _CFG.get("rfmsr_path", "ckpts/rfmsr.safetensors")
 MODEL_CONFIG = _CFG.get("model_config", "configs/rfmsr.yaml")
 FLOW_SIGMA = _CFG.get("flow_sigma", 1.0)
 INFER_STEPS = _CFG.get("steps", 28)
