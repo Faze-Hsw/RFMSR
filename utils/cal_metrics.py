@@ -96,10 +96,8 @@ def main():
     parser = argparse.ArgumentParser(description="Calculate SR metrics with GT reference")
     parser.add_argument("--gt_dir", type=str, required=True, help="Ground truth (HR) image directory")
     parser.add_argument("--sr_dir", type=str, required=True, help="SR result image directory")
-    parser.add_argument("--bs", type=int, default=8, help="Batch size")
+    parser.add_argument("--bs", type=int, default=1, help="Batch size")
     parser.add_argument("--log_name", type=str, default="metrics.log", help="Log filename")
-    parser.add_argument("--test_y_channel", action="store_true", default=True,
-                        help="Use Y channel for PSNR/SSIM")
     parser.add_argument("--no_y_channel", action="store_true",
                         help="Use RGB for PSNR/SSIM instead of Y channel")
     args = parser.parse_args()

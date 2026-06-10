@@ -339,7 +339,7 @@ class RFMSRTrainer:
         """初始化 LPIPS 和 CLIPIQA 指标模型。"""
         try:
             import lpips
-            self.lpips_fn = lpips.LPIPS(net="vgg").to(self.device)
+            self.lpips_fn = lpips.LPIPS(net="alex").to(self.device)
         except ImportError:
             print("[WARN] lpips not installed, LPIPS will be skipped")
         try:
