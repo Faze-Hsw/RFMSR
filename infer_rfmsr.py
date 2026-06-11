@@ -76,24 +76,30 @@ class RFMSRInferencer:
 
     # ---- 模型加载 ----
 
-    def load(self):
-        """加载 SD2.1 VAE + RFMSR + DINOv2。"""
+    def load(self, vae_path=None, rfmsr_path=None, model_config=None, denoise_device=None):
+        """加载 SD2.1 VAE + RFMSR + DINOv2。CLI 传参可覆盖 YAML 默认值。"""
         from diffusers import AutoencoderKL
 
-        print(f"Loading SD2.1 VAE from {VAE_PATH} -> {DENOISE_DEVICE}...")
-        self.ae = AutoencoderKL.from_pretrained(VAE_PATH, subfolder="vae")
-        self.ae = self.ae.to(DENOISE_DEVICE).eval()
+        _vae = vae_path or VAE_PATH
+        _rfmsr = rfmsr_path or RFMSR_PATH
+        _model = model_config or MODEL_CONFIG
+        _device = denoise_device or DENOISE_DEVICE
+        self._device = _device
+
+        print(f"Loading SD2.1 VAE from {_vae} -> {_device}...")
+        self.ae = AutoencoderKL.from_pretrained(_vae, subfolder="vae")
+        self.ae = self.ae.to(_device).eval()
         self.ae.requires_grad_(False)
         print(f"  VAE scaling_factor: {self.ae.config.scaling_factor}")
 
-        print(f"Loading RFMSR from {RFMSR_PATH} ...")
-        self.rfmsr = create_rfmsr(MODEL_CONFIG)
-        sd = safe_load(RFMSR_PATH)
+        print(f"Loading RFMSR from {_rfmsr} ...")
+        self.rfmsr = create_rfmsr(_model)
+        sd = safe_load(_rfmsr)
         # VOSR checkpoint: raw DiT params (no prefix) → RFMSR expects "dit." prefix
         sd.pop("ema_scale", None)
         sd = {"dit." + k if not k.startswith("dit.") else k: v for k, v in sd.items()}
         missing, unexpected = self.rfmsr.load_state_dict(sd, strict=False)
-        self.rfmsr = self.rfmsr.to(DENOISE_DEVICE, dtype=torch.float32)
+        self.rfmsr = self.rfmsr.to(_device, dtype=torch.float32)
         self.rfmsr.eval()
         self.rfmsr.dit.use_checkpoint = False
         n = sum(p.numel() for p in self.rfmsr.parameters()) / 1e6
@@ -104,7 +110,7 @@ class RFMSRInferencer:
             print(f"  Unexpected keys: {unexpected}")
 
         print(f"Loading DINOv2 encoder ...")
-        self.venc = create_dinov2_encoder(MODEL_CONFIG, device=DENOISE_DEVICE)
+        self.venc = create_dinov2_encoder(_model, device=_device)
         if self.venc is not None:
             print(f"  DINOv2: loaded")
 
@@ -284,7 +290,7 @@ class RFMSRInferencer:
 
         im_np = np.array(target).astype(np.float32) / 255.0
         im_cond = torch.from_numpy(np.moveaxis(im_np, 2, 0)).unsqueeze(0)
-        im_cond = im_cond.to(dtype=torch.bfloat16, device=DENOISE_DEVICE)
+        im_cond = im_cond.to(dtype=torch.bfloat16, device=self._device)
         ori_h, ori_w = im_cond.shape[-2:]
 
         # ---- 对齐到 16 倍数 ----
@@ -353,20 +359,28 @@ def main(
     tile_size: int = None,
     tile_stride: int = None,
     color_correction: str = COLOR_CORRECTION,
+    vae_path: str = None,
+    rfmsr_path: str = None,
+    model_config: str = None,
+    denoise_device: str = None,
 ):
     """RFMSR Residual Flow Matching 超分推理。
 
     Args:
-        input:        输入图片或文件夹路径 (必填)
-        output:       输出目录
-        scale:        放大倍数
-        steps:        逆流积分步数 (默认从配置读取)
-        flow_sigma:   噪声标准差 (默认从配置读取)
-        seed:         随机种子
-        chopping:     是否启用分块推理 (默认从配置读取)
-        tile_size:    像素空间 tile 大小
-        tile_stride:  像素空间 stride
-        color_correction: 颜色校正方法 ('adain', 'wavelet', 'ycbcr', 'none').
+        input:           输入图片或文件夹路径 (必填)
+        output:          输出目录
+        scale:           放大倍数
+        steps:           逆流积分步数 (默认从配置读取)
+        flow_sigma:      噪声标准差 (默认从配置读取)
+        seed:            随机种子
+        chopping:        是否启用分块推理 (默认从配置读取)
+        tile_size:       像素空间 tile 大小
+        tile_stride:     像素空间 stride
+        color_correction:颜色校正方法 ('adain', 'wavelet', 'ycbcr', 'none').
+        vae_path:        SD2.1 VAE 路径 (默认从配置读取)
+        rfmsr_path:      RFMSR 权重路径 (默认从配置读取)
+        model_config:    DiT 架构配置路径 (默认从配置读取)
+        denoise_device:  推理设备 (默认从配置读取)
     """
     init_image = input
     if init_image is None:
@@ -404,7 +418,8 @@ def main(
     print(f"{'=' * 50}\n")
 
     inferencer = RFMSRInferencer()
-    inferencer.load()
+    inferencer.load(vae_path=vae_path, rfmsr_path=rfmsr_path,
+                    model_config=model_config, denoise_device=denoise_device)
 
     out_root = Path(output)
     pbar = tqdm(img_files, desc="Inference", unit="img")
