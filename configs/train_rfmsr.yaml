@@ -54,8 +54,8 @@ experiment:
 # ---- 验证 ----
 validation:
   enabled: true
-  lq_dir: assets/test_lq
-  gt_dir: assets/test_gt
+  lq_dir: assets/validate_lq
+  gt_dir: assets/validate_gt
   scale: 4.0
   steps: 15               # 推理步数
   seed: 42

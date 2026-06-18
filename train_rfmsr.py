@@ -92,9 +92,15 @@ class RFMSRTrainer:
         tcfg = self.cfg["training"]
         self.accumulation_steps = tcfg.get("gradient_accumulation_steps", 1)
 
-        # 验证指标
+        # 验证指标（与 cal_metrics.py 计算逻辑完全一致）
         self.val_enabled = self.cfg.get("validation", {}).get("enabled", False)
         self.lpips_fn = None
+        self.psnr_metric = None
+        self.ssim_metric = None
+        self.dists_metric = None
+        self.niqe_metric = None
+        self.musiq_metric = None
+        self.maniqa_metric = None
         self.clipiqa_metric = None
         if self.val_enabled:
             self._init_val_metrics()
@@ -336,7 +342,7 @@ class RFMSRTrainer:
     # ------------------------------------------------------------------
 
     def _init_val_metrics(self):
-        """初始化 LPIPS 和 CLIPIQA 指标模型。"""
+        """初始化全量验证指标（与 cal_metrics.py 计算逻辑完全一致）。"""
         try:
             import lpips
             self.lpips_fn = lpips.LPIPS(net="alex").to(self.device)
@@ -344,13 +350,24 @@ class RFMSRTrainer:
             print("[WARN] lpips not installed, LPIPS will be skipped")
         try:
             import pyiqa
+            # Full-reference（Y 通道，与 cal_metrics.py 一致）
+            self.psnr_metric = pyiqa.create_metric(
+                "psnr", test_y_channel=True, color_space="ycbcr", device=self.device)
+            self.ssim_metric = pyiqa.create_metric(
+                "ssim", test_y_channel=True, color_space="ycbcr", device=self.device)
+            self.dists_metric = pyiqa.create_metric("dists", device=self.device)
+            # No-reference
+            self.niqe_metric = pyiqa.create_metric("niqe", device=self.device)
+            self.musiq_metric = pyiqa.create_metric("musiq", device=self.device)
+            self.maniqa_metric = pyiqa.create_metric("maniqa", device=self.device)
             self.clipiqa_metric = pyiqa.create_metric("clipiqa", device=self.device)
+            print("✅ Validation metrics initialized: PSNR, SSIM, LPIPS, DISTS, NIQE, MUSIQ, MANIQA, CLIPIQA")
         except ImportError:
-            print("[WARN] pyiqa not installed, CLIPIQA will be skipped")
+            print("[WARN] pyiqa not installed, all FR/NR metrics will be skipped")
 
     @torch.no_grad()
     def validate(self, step: int):
-        """验证：推理 test_lq → 计算 LPIPS/CLIPIQA → 保存 SR 图片。"""
+        """验证：推理 test_lq → 计算 PSNR/SSIM/LPIPS/DISTS/NIQE/MUSIQ/MANIQA/CLIPIQA → 保存 SR 图片。"""
         self.rfmsr.eval()
 
         # ---- EMA swap: 验证时使用 EMA 权重，与 save_checkpoint 导出的推理权重一致 ----
@@ -360,8 +377,8 @@ class RFMSRTrainer:
             self.rfmsr.load_state_dict(self.ema_state)
 
         val_cfg = self.cfg.get("validation", {})
-        lq_dir = Path(val_cfg.get("lq_dir", "assets/test_lq"))
-        gt_dir = Path(val_cfg.get("gt_dir", "assets/test_gt"))
+        lq_dir = Path(val_cfg.get("lq_dir", "assets/validate_lq"))
+        gt_dir = Path(val_cfg.get("gt_dir", "assets/validate_gt"))
         val_steps = val_cfg.get("steps", 15)
         val_scale = val_cfg.get("scale", 4.0)
         val_seed = val_cfg.get("seed", 42)
@@ -389,8 +406,9 @@ class RFMSRTrainer:
             self.rfmsr.train()
             return
 
-        lpips_vals = []
-        clipiqa_vals = []
+        # 全量指标收集（与 cal_metrics.py 一致）
+        psnr_vals, ssim_vals, lpips_vals, dists_vals = [], [], [], []
+        niqe_vals, musiq_vals, maniqa_vals, clipiqa_vals = [], [], [], []
 
         for lq_path, gt_path in tqdm(pairs, desc=f"Val@{step}", leave=False):
             # ---- 加载 & resize LR ----
@@ -447,30 +465,53 @@ class RFMSRTrainer:
             sr_np = np.moveaxis(sr_np, 0, 2)
             Image.fromarray(sr_np).save(out_dir / lq_path.name)
 
-            # ---- LPIPS ----
+            # ---- 准备 GT tensor（所有 FR 指标共用） ----
+            gt_np = np.array(gt_img).astype(np.float32) / 255.0
+            gt_tensor = torch.from_numpy(np.moveaxis(gt_np, 2, 0)).unsqueeze(0)
+            gt_tensor = gt_tensor.to(self.device)
+
+            # ---- Full-Reference（与 cal_metrics.py 完全一致） ----
+            if self.psnr_metric is not None:
+                psnr_vals.append(self.psnr_metric(sr_decoded, gt_tensor).mean().item())
+            if self.ssim_metric is not None:
+                ssim_vals.append(self.ssim_metric(sr_decoded, gt_tensor).mean().item())
+            if self.dists_metric is not None:
+                dists_vals.append(self.dists_metric(sr_decoded, gt_tensor).mean().item())
+
+            # ---- LPIPS (expects [-1, 1]) ----
             if self.lpips_fn is not None:
-                gt_np = np.array(gt_img).astype(np.float32) / 255.0
-                gt_tensor = torch.from_numpy(np.moveaxis(gt_np, 2, 0)).unsqueeze(0)
-                gt_tensor = gt_tensor.to(self.device)
-                # LPIPS expects [-1, 1]
                 gt_norm = (gt_tensor - 0.5) / 0.5
                 sr_norm = (sr_decoded - 0.5) / 0.5
                 lpips_vals.append(self.lpips_fn(gt_norm, sr_norm).mean().item())
 
-            # ---- CLIPIQA (no-reference, 只评估 SR) ----
+            # ---- No-Reference（与 cal_metrics.py 完全一致） ----
+            if self.niqe_metric is not None:
+                niqe_vals.append(self.niqe_metric(sr_decoded).mean().item())
+            if self.musiq_metric is not None:
+                musiq_vals.append(self.musiq_metric(sr_decoded).mean().item())
+            if self.maniqa_metric is not None:
+                maniqa_vals.append(self.maniqa_metric(sr_decoded).mean().item())
             if self.clipiqa_metric is not None:
                 clipiqa_vals.append(self.clipiqa_metric(sr_decoded).mean().item())
 
-        # ---- 打印结果 ----
-        parts = []
+        # ---- 打印结果（与 cal_metrics.py 格式一致） ----
+        print(f"\n[Val @ step {step}] images={total}")
+        if psnr_vals:
+            print(f"  PSNR (Y):      {np.mean(psnr_vals):>8.2f} dB")
+        if ssim_vals:
+            print(f"  SSIM (Y):      {np.mean(ssim_vals):>8.4f}")
         if lpips_vals:
-            avg_lpips = float(np.mean(lpips_vals))
-            parts.append(f"LPIPS={avg_lpips:.4f}")
+            print(f"  LPIPS (Alex):  {np.mean(lpips_vals):>8.4f}")
+        if dists_vals:
+            print(f"  DISTS:         {np.mean(dists_vals):>8.4f}")
+        if niqe_vals:
+            print(f"  NIQE:          {np.mean(niqe_vals):>8.4f}")
+        if musiq_vals:
+            print(f"  MUSIQ:         {np.mean(musiq_vals):>8.4f}")
+        if maniqa_vals:
+            print(f"  MANIQA:        {np.mean(maniqa_vals):>8.4f}")
         if clipiqa_vals:
-            avg_clipiqa = float(np.mean(clipiqa_vals))
-            parts.append(f"CLIPIQA={avg_clipiqa:.4f}")
-        parts.append(f"images={total}")
-        print(f"\n[Val @ step {step}] {', '.join(parts)}")
+            print(f"  CLIPIQA:       {np.mean(clipiqa_vals):>8.4f}")
         print(f"  SR saved to: {out_dir}\n")
 
         # ---- 恢复原始权重 ----
