@@ -52,12 +52,13 @@ torch.backends.cudnn.benchmark = True
 
 class RFMSRTrainer:
 
-    def __init__(self):
+    def __init__(self, resume_path: str = None):
         _script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(_script_dir, "configs", "train_rfmsr.yaml")
         with open(config_path, "r", encoding="utf-8") as f:
             self.cfg = yaml.safe_load(f)
 
+        self.resume_path = resume_path
         self.device = torch.device(self.cfg["denoise_device"])
         self._setup_seed(self.cfg["training"]["seed"])
 
@@ -147,6 +148,15 @@ class RFMSRTrainer:
     def _build_rfmsr(self):
         cfg_path = self.cfg["model_config"]
         self.rfmsr = create_rfmsr(cfg_path).to(self.device)
+
+        # 预训练权重初始化（兼容 VOSR checkpoint），resume 时跳过
+        if self.resume_path:
+            print("⏭️  Skipping pretrained init (will restore from resume checkpoint)")
+        else:
+            pretrained_ckpt = self.cfg.get("pretrained_ckpt", None)
+            if pretrained_ckpt:
+                self.rfmsr.load_pretrained(pretrained_ckpt)
+
         n_params = sum(p.numel() for p in self.rfmsr.parameters())
         print(f"✅ RFMSR: {n_params / 1e6:.1f}M params")
 
@@ -637,7 +647,7 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Path to training state checkpoint")
     args = parser.parse_args()
 
-    trainer = RFMSRTrainer()
+    trainer = RFMSRTrainer(resume_path=args.resume)
     if args.resume:
         trainer.load_checkpoint(args.resume)
     trainer.train()

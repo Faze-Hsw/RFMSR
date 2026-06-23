@@ -17,6 +17,9 @@ data:
 vae_path: ckpts/stable-diffusion-2-1-base
 denoise_device: cuda
 
+# ---- VOSR 预训练权重（可选，用于初始化 LightningDiT 参数） ----
+pretrained_ckpt: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
+
 # ---- DINOv2（冻结，提取 LR 语义特征注入 DiT Cross-Attention） ----
 dinov2:
   enabled: true

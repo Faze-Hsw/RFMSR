@@ -16,9 +16,11 @@ RFMSR — Residual Flow Matching DiT (SD2.1 VAE 潜空间)
     → unpatchify → [B, 4, H, W]
 """
 
+import math
 import torch
 import torch.nn as nn
 import yaml
+from safetensors.torch import load_file as safetensors_load
 
 from .lightningdit import LightningDiT
 
@@ -68,6 +70,65 @@ class RFMSR(nn.Module):
             encdim_ratio=encdim_ratio,
             auxiliary_time_cond=False,
         )
+
+    def load_pretrained(self, ckpt_path: str, verbose: bool = True):
+        """从 VOSR 预训练权重初始化 RFMSR（兼容 key 前缀和 pos_embed 尺寸差异）。
+
+        VOSR checkpoint 的 key 为裸 LightningDiT (如 blocks.0.attn.qkv.weight)，
+        RFMSR 内部用 self.dit 包裹，key 多了 dit. 前缀，此处自动匹配。
+        """
+        if ckpt_path.endswith(".safetensors"):
+            state_dict = safetensors_load(ckpt_path)
+        else:
+            state_dict = torch.load(ckpt_path, map_location="cpu")
+
+        target_state = self.state_dict()
+        new_state_dict = {}
+        skipped = 0
+        loaded = 0
+
+        # 自动检测是否需要 dit. 前缀
+        need_prefix = "dit." if any(k.startswith("dit.") for k in target_state) else ""
+
+        for k, v in state_dict.items():
+            target_k = k
+            if k not in target_state and need_prefix:
+                target_k = need_prefix + k
+
+            if target_k not in target_state:
+                skipped += 1
+                if verbose and skipped <= 3:
+                    print(f"[RFMSR] Skipping {k} (not in model)")
+                continue
+            # 跳过 RoPE/freqs（模型会根据当前 input_size 自动生成）
+            if "rope" in k or "freqs_cos" in k or "freqs_sin" in k:
+                continue
+            # pos_embed 尺寸不匹配时 bicubic 插值
+            if "pos_embed" in target_k and v.shape != target_state[target_k].shape:
+                if verbose:
+                    print(f"[RFMSR] Interpolating pos_embed: {v.shape} → {target_state[target_k].shape}")
+                v_len = v.shape[1]
+                target_len = target_state[target_k].shape[1]
+                dim = v.shape[-1]
+                src_size = int(math.sqrt(v_len))
+                tgt_size = int(math.sqrt(target_len))
+                v_img = v.reshape(1, src_size, src_size, dim).permute(0, 3, 1, 2)
+                v_img = nn.functional.interpolate(
+                    v_img, size=(tgt_size, tgt_size), mode="bicubic", align_corners=False
+                )
+                v = v_img.permute(0, 2, 3, 1).reshape(1, tgt_size * tgt_size, dim)
+            new_state_dict[target_k] = v
+            loaded += 1
+
+        msg = self.load_state_dict(new_state_dict, strict=False)
+        if verbose:
+            if skipped > 0:
+                print(f"[RFMSR] Skipped {skipped} incompatible keys")
+            if msg.missing_keys:
+                print(f"[RFMSR] Missing keys: {len(msg.missing_keys)}")
+            if msg.unexpected_keys:
+                print(f"[RFMSR] Unexpected keys: {len(msg.unexpected_keys)}")
+            print(f"[RFMSR] Loaded {loaded} params from {ckpt_path}")
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, z_lr: torch.Tensor,
                 venc_fea=None) -> torch.Tensor:
