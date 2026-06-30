@@ -13,12 +13,40 @@
 import os
 import sys
 import math
+import ssl
 import argparse
+import warnings
 from pathlib import Path
+
+# Suppress third-party deprecation noise
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="clip")
+warnings.filterwarnings("ignore", message=".*pkg_resources.*")
+
+# Windows Miniconda: HF mirror + SSL bypass + pyiqa cache path
+os.environ['TORCH_HOME'] = 'C:/Users/12467/.cache/torch'
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+os.environ['REQUESTS_CA_BUNDLE'] = ''
+os.environ['CURL_CA_BUNDLE'] = ''
+ssl._create_default_https_context = ssl._create_unverified_context
 
 import torch
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
+
+# Patch huggingface_hub session to use verify=False (Windows Miniconda SSL)
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    import huggingface_hub.utils._http as _hf_http
+    _orig_get_session = _hf_http.get_session
+    def _patched_get_session(*a, **kw):
+        s = _orig_get_session(*a, **kw)
+        s.verify = False
+        return s
+    _hf_http.get_session = _patched_get_session
+except Exception:
+    pass
 
 
 def scan_flat(dir_path: Path, exts: list[str]) -> list[Path]:
