@@ -23,8 +23,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="clip")
 warnings.filterwarnings("ignore", message=".*pkg_resources.*")
 
-# Windows Miniconda: HF mirror + SSL bypass + pyiqa cache path
-os.environ['TORCH_HOME'] = 'C:/Users/12467/.cache/torch'
+# Windows Miniconda: HF mirror + SSL bypass
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ['REQUESTS_CA_BUNDLE'] = ''
 os.environ['CURL_CA_BUNDLE'] = ''
