@@ -21,7 +21,7 @@ dinov2:
   enabled: true
 
 training:
-  iterations: 200000
+  iterations: 10000
   lr: 5.0e-5
   adam_beta1: 0.9
   adam_beta2: 0.999

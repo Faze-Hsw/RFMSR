@@ -26,11 +26,11 @@ dinov2:
 
 # ---- 训练 ----
 training:
-  iterations: 500000
+  iterations: 10000
   lr: 5.0e-5
   adam_beta1: 0.9
   adam_beta2: 0.999
-  adam_weight_decay: 0.01
+  adam_weight_decay: 0.0
   adam_epsilon: 1.0e-8
   gradient_accumulation_steps: 1   
   gradient_clip: 1.0

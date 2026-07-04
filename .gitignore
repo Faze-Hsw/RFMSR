@@ -9,3 +9,10 @@ testdata/
 traindata/
 experiments/
 *.safetensors
+*.pth
+*.log
+venv/
+.venv/
+*.egg-info/
+dist/
+build/

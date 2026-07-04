@@ -753,7 +753,7 @@ class RFMSROneStepTrainer:
                     batch = next(data_iter)
 
                 # G/D 交替: batch 级 (不受 accumulation 影响)
-                train_d = (batch_idx % self.disc_update_freq == 0)
+                train_d = (self.gan_weight > 0 and batch_idx % self.disc_update_freq == 0)
                 batch_idx += 1
 
                 loss_dict = self.train_step(batch, train_disc=train_d)
