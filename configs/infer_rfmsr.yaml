@@ -13,7 +13,7 @@ model_config: configs/rfmsr.yaml
 flow_sigma: 1.0
 
 # Reverse integration steps (t: 1.0 → 0.0)
-steps: 15
+steps: 1
 
 # Upscale factor (output size = input × scale)
 scale: 4.0
