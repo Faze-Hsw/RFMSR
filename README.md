@@ -1,162 +1,261 @@
-# Flux SR
+<div align="center">
 
-基于 Black Forest Labs [FLUX.1](https://github.com/black-forest-labs/flux) 的 img2img 图像超分/增强工具。
+# RFMSR: Residual Flow Matching for Image Super-Resolution
 
-## 环境配置
+<p align="center"><i>Residual Flow Matching in SD2.1 VAE Latent Space with LightningDiT.</i></p>
 
-### 硬件要求
 
-- **GPU 显存**：≥16GB（flux-dev 约 22GB，flux-schnell 约 14GB）
-- **磁盘空间**：≥40GB（模型权重约 34GB）
-- 推荐 A100 / RTX 4090 / 3090
+[![HF-Model](https://img.shields.io/badge/🤗%20RFMSR-HuggingFace-FCC624.svg)](https://huggingface.co/CSWRY/RFMSR)
 
-### 安装
+</div>
 
-**Python 版本要求**：≥ 3.10（推荐 3.10 ~ 3.12）
+<p align="center">
+  <img src="assets/overview.png" alt="RFMSR overview" width="100%">
+</p>
+<p align="center"><em>Overview of the RFMSR framework. <b>Forward:</b> the residual flow progressively injects noise into the HQ latent along the residual path (HQ → LR). <b>Reverse:</b> the network learns to denoise and recover the HQ latent from the LR condition, yielding the SR result.</em></p>
+
+
+## News
+
+- **2026-07** — Initial release: training & inference code, one-step and multi-step checkpoints.
+
+
+## Preparation
+
+### Hardware Requirements
+
+- **GPU VRAM**: >= 16 GB (recommended >= 24 GB for training)
+- **Disk**: >= 10 GB (model weights ~5.5 GB + training data)
+- Recommended: A100 / RTX 4090 / 3090
+
+### Installation
+
+**Python >= 3.10** (recommended 3.10 ~ 3.12)
 
 ```bash
-# 0. (推荐) 创建虚拟环境
-#    使用 conda：
-conda create -n flux_sr python=3.12 -y
-conda activate flux_sr
+# 0. Create virtual environment (recommended)
+conda create -n rfmsr python=3.12 -y
+conda activate rfmsr
 
-#    或使用 venv：
-# python -m venv .venv
-# .venv\Scripts\activate
-
-# 1. (可选) 先安装 PyTorch CUDA 版本（requirements.txt 默认装 CPU 版）
-#    根据你的 CUDA 版本选择，例如 CUDA 12.1：
+# 1. Install PyTorch (CUDA version)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-#    如果 CUDA 版本不同，访问 https://pytorch.org 查看对应命令
-
-# 2. 进入项目目录
-cd d:/Projects/flux_sr
-
-# 3. 安装其余依赖
+# 2. Install other dependencies
 pip install -r requirements.txt
+```
 
-# 4. HuggingFace 认证
-#    需要接受 Black Forest Labs 的模型协议
-#    访问 https://huggingface.co/black-forest-labs/FLUX.1-dev 并接受许可
+### Pretrained Weights
+
+Download pretrained weights into `ckpts/`:
+
+| File | Size | Description |
+|------|------|-------------|
+| `rfmsr.safetensors` | 1.81 GB | Multi-step Flow Matching checkpoint |
+| `rfmsr_os.safetensors` | 1.81 GB | One-step distillation checkpoint (recommended) |
+| `sd21_lwdecoder.pth` | 50 MB | SD2.1 lightweight decoder |
+| `stable-diffusion-2-1-base/` | — | SD2.1 VAE (auto-download via diffusers) |
+
+**Option A: HuggingFace (recommended)**
+
+Model weights are available at [CSWRY/RFMSR](https://huggingface.co/CSWRY/RFMSR) on HuggingFace.
+
+```bash
+# Download ckpts from HuggingFace
 huggingface-cli login
-
-#    或者设置环境变量（跳过交互式登录）：
-#    set HF_TOKEN=hf_xxxxxxxxxx
-
-# 5. （可选）配置镜像加速
-#    在 infer.py 中已默认设置 HF_ENDPOINT=https://hf-mirror.com
-#    手动修改或删除该设置即可切换
-
-# 6. （可选）修改缓存路径，避免塞满 C 盘
-#    set HF_HOME=D:/huggingface_cache
+huggingface-cli download CSWRY/RFMSR ckpts/ --local-dir . --local-dir-use-symlinks False
 ```
 
-> **⚠️ 注意**：`requirements.txt` 中的 `torch>=2.1.0` 默认会安装 CPU 版 PyTorch，**务必先手动安装 CUDA 版 PyTorch**（上面第 1 步），否则推理会很慢或无法使用 GPU。
-
-### 手动下载权重
-
-完整运行需要以下 4 个组件：
-
-| 组件 | 类型 | 下载地址 | 自动下载？ |
-|------|------|---------|-----------|
-| **flux1-dev.safetensors** | Flux Transformer | [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) | ✅ |
-| **ae.safetensors** | VAE | [FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) | ✅ |
-| **google/t5-v1_1-xxl** | T5 文本编码器 | HuggingFace | ✅ (transformers) |
-| **openai/clip-vit-large-patch14** | CLIP 文本编码器 | HuggingFace | ✅ (transformers) |
-
-**手动放置路径**（如需跳过自动下载）：
+**Option B: Manual placement**
 
 ```
-checkpoints/
-└── black-forest-labs_FLUX.1-dev/
-    ├── flux1-dev.safetensors   # ~23GB
-    └── ae.safetensors          # ~300MB
+ckpts/
+├── rfmsr.safetensors
+├── rfmsr_os.safetensors
+├── sd21_lwdecoder.pth
+├── stable-diffusion-2-1-base/
+└── VOSR_0.5B_ms/
+    └── checkpoints/
+        └── ema_model.safetensors   # optional, for training init
 ```
 
-**环境变量覆盖**（完全自定义路径）：
+### Data Preparation
+
+Training data (`traindata/`): place HR images (DIV2K, Flickr2K, etc.) directly under this directory.
+
+Validation data (`assets/validate_gt/`, `assets/validate_lq/`): paired 512x512 HR/LR images for validation during training.
+
+Test data (`testdata/`): LSDIR, ImageNet512, and RealSR benchmarks for evaluation.
+
+
+## Training
+
+### Stage 1: Multi-step Flow Matching
+
+Train the LightningDiT with Residual Flow Matching (velocity prediction):
 
 ```bash
-# 不放在 checkpoints 目录，直接指向已下载的文件
-set FLUX_MODEL=D:/models/flux1-dev.safetensors
-set FLUX_AE=D:/models/ae.safetensors
+python train_rfmsr.py
 ```
 
-**文本编码器说明**：
-- T5-XXL 和 CLIP 通过 `transformers` 库自动下载到 `~/.cache/huggingface/`
-- 如果需要离线使用，需提前下载对应模型到 transformers 缓存目录
-- 或使用 `HF_HUB_OFFLINE=1` + 预下载的缓存
+Key configuration in `configs/train_rfmsr.yaml`:
+- 10,000 iterations, batch size 32, GT crop 512x512
+- Learning rate 5e-5, EMA rate 0.999, bf16 AMP
+- RealESRGAN degradation pipeline (blur + noise + JPEG + resize)
+- Pretrained init from VOSR checkpoint (optional)
 
-## 使用方法
+Residual FM formulation:
+- Flow path: `x_t = z_hr + t * (z_lr - z_hr) + t * sigma * epsilon`
+- Target velocity: `v_gt = (z_lr - z_hr) + sigma * epsilon`
+- Network input: `cat(z_lr[4ch], x_t[4ch]) + DINOv2 Cross-Attention`
 
-### 快速开始
+### Stage 2: One-Step Distillation (L2 + LPIPS + GAN)
+
+Distill the multi-step model into a one-step generator with perceptual and adversarial losses:
 
 ```bash
-# 模型权重会自动下载并缓存到 ./checkpoints/ 目录
-
-# 小图增强（scale=1 保持原尺寸）
-python infer.py --init_image input.png
-
-# 2x 超分
-python infer.py --init_image input.png --scale 2.0
-
-# 精调参数
-python infer.py --init_image input.png --scale 4.0 --cfg 3.0 --steps 28 --seed 42
+python train_rfmsr_os.py
 ```
 
-### 分块推理（处理大图）
+Key configuration in `configs/train_rfmsr_os.yaml`:
+- Losses: velocity supervision + LPIPS (VGG) + Hinge GAN
+- PatchGAN discriminator in 4-channel latent space
+- Student initialized from `ckpts/rfmsr.safetensors`
+- Validation runs both 1-step and 15-step inference for comparison
 
-当输入图像尺寸较大时（如 2K/4K），必须启用分块推理：
+
+## Inference
+
+### Quick Start
 
 ```bash
-python infer.py --init_image large_image.jpg --scale 1.0 ^
-    --chopping_enabled true ^
-    --chopping_pch_size 1024 ^
-    --chopping_stride_ratio 0.5
+# One-step inference (fast, recommended)
+python infer_rfmsr.py --input input.png --steps 1
+
+# Multi-step inference (higher quality)
+python infer_rfmsr.py --input input.png --steps 15
+
+# Process a folder
+python infer_rfmsr.py --input ./test_images/ --scale 4.0 --steps 15
 ```
 
-### 使用自定义配置文件
+### Command-Line Arguments
 
-修改 `configs/infer_flux.yaml` 设置默认参数，然后：
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--input` | (required) | Input image or directory |
+| `--rfmsr_path` | `ckpts/rfmsr_os.safetensors` | Path to RFMSR checkpoint |
+| `--scale` | 4.0 | Upscale factor |
+| `--steps` | 15 | Reverse integration steps (1 for one-step) |
+| `--flow_sigma` | 1.0 | Noise standard deviation |
+| `--seed` | 42 | Random seed |
+| `--color_correction` | wavelet | Color correction: `adain` / `wavelet` / `ycbcr` / `none` |
+| `--chopping` | True | Tiled inference for large images |
+| `--tile_size` | 512 | Pixel-space tile size |
+| `--tile_stride` | 256 | Sliding window stride |
+| `--vae_path` | `ckpts/stable-diffusion-2-1-base` | SD2.1 VAE path |
+| `--denoise_device` | cuda | Device for RFMSR + VAE |
+| `--output` | outputs | Output directory |
 
-```bash
-python infer_flux.py --config configs/infer_flux.yaml --init_image input.png
+### One-Step vs Multi-Step
+
+| Mode | Steps | Speed | Quality | Use Case |
+|------|-------|-------|---------|----------|
+| One-step (`rfmsr_os`) | 1 | Fast | Good | Real-time / batch processing |
+| Multi-step (`rfmsr`) | 15 | Slower | Best | Maximum quality |
+
+
+## Model Architecture
+
+RFMSR uses a **LightningDiT** backbone operating in SD2.1 VAE latent space:
+
+```
+Input: cat(z_lr[4ch], x_t[4ch]) → [B, 8, H, W]
+  ├── PatchEmbed (patch_size=2) → tokens [B, N, 1024]
+  ├── TimestepEmbedder (sinusoidal + MLP)
+  ├── LightningDiTBlock × 28
+  │     ├── Self-Attention + QK-Norm + RoPE
+  │     ├── Cross-Attention (DINOv2 semantic features)
+  │     ├── SwiGLU FFN
+  │     └── AdaLN (time-conditioned scale/shift)
+  └── FinalLayer → unpatchify → v [B, 4, H, W]
 ```
 
-### 模型变体选择
+Key design choices:
+- RoPE positional encoding for spatial awareness
+- RMSNorm for stable training
+- DINOv2 frozen encoder (ViT-B) injects semantic features via Cross-Attention
+- SwiGLU activation in FFN layers
+- AdaLN modulation conditioned on timestep `t`
 
-| 模型 | 特点 | 步数 | 推荐用途 |
-|------|------|------|---------|
-| `flux-dev` | 高质量，Guidance 蒸馏 | 28~50 | 首选超分 |
-| `flux-schnell` | 4 步快速推理 | 4 | 快速预览 |
-| `flux-dev-canny` | Canny 边缘控制 | 28 | 结构保持超分 |
-| `flux-dev-depth` | 深度图控制 | 28 | 立体感增强 |
+Dependencies:
+- `diffusers` — SD2.1 VAE encoder/decoder (frozen)
+- `timm` — PatchEmbed
+- `torch.hub` — DINOv2 (facebookresearch/dinov2)
+- `basicsr` — RealESRGAN degradation
 
-## 参数说明
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--init_image` | (必填) | 输入图像路径 |
-| `--scale` | 1.0 | 放大倍数，输出尺寸 = 原图 × scale |
-| `--start_timestep` | 1.0 | 起始时间步 (0~1)，1.0=完全重绘，0.5=半保留原图结构 |
-| `--cfg` | 3.5 | CFG 引导权重（dev 推荐 2.5~4.0，schnell 忽略） |
-| `--steps` | 28 | 采样步数（dev 推荐 28~50，schnell 固定 4） |
-| `--seed` | 42 | 随机种子（相同种子 + 相同输入 = 可复现结果） |
-| `--model_name` | flux-dev | 模型名称 |
-| `--t5_max_length` | 512 | T5 最大序列长度（dev=512，schnell=256） |
-| `--out_dir` | outputs | 输出目录（自动创建） |
-| `--verbose` | false | 打印详细日志 |
-| `--text_encoder_device` | cuda | T5+CLIP 所在设备（省显存可设为 "cpu"） |
-| `--denoise_device` | cuda | Flux+VAE 所在设备 |
-| **Chopping：** | | |
-| `--chopping_enabled` | false | 启用像素空间分块推理 |
-| `--chopping_pch_size` | 1024 | 分块边长（需为 16 倍数） |
-| `--chopping_stride_ratio` | 0.5 | 滑窗步长比例 |
-| `--chopping_extra_bs` | 1 | 并行处理 patch 数 |
-| `--chopping_weight_type` | Gaussian | 融合权重类型 |
+## Evaluation Metrics
 
-## 输出
+The training script evaluates the following metrics during validation:
 
-- 输出文件：`{输入文件名}_sr.png`
-- 输出目录：默认为 `outputs/`（通过 `--out_dir` 修改）
-- 输出尺寸：`ceil(原图宽 × scale) × ceil(原图高 × scale)`
+- **PSNR** / **SSIM** — distortion-based metrics
+- **LPIPS** (Alex) — perceptual similarity
+- **DISTS** — deep image structure and texture similarity
+- **NIQE** — no-reference image quality
+- **MUSIQ** / **MANIQA** / **CLIPIQA** — transformer-based IQA
+
+
+## Visual Comparisons
+
+Below are qualitative comparisons on benchmark datasets. Each figure shows the low-quality (LQ) input, ground-truth high-quality (HQ) image, and results from competing methods (SeeSR, VOSR, ResShift, InvSR, OSEDiff) alongside RFMSR in both multi-step (15-step) and one-step modes. RFMSR preserves fine textures, text clarity, and natural details while avoiding hallucination and artifacts.
+
+### Portrait
+
+<p align="center">
+  <img src="assets/comparison_1.png" alt="RFMSR portrait comparison" width="100%">
+</p>
+<p align="center"><em>Portrait super-resolution (4×). RFMSR-15 and RFMSR-1 faithfully recover facial details without over-smoothing or hallucinated artifacts.</em></p>
+
+### Text & Logo
+
+<p align="center">
+  <img src="assets/comparison_2.png" alt="RFMSR text comparison" width="100%">
+</p>
+<p align="center"><em>Text super-resolution (4×). RFMSR preserves sharp letter edges and correct glyph shapes, while one-step baselines (VOSR-1, InvSR-1, OSEDiff-1) introduce distortion or miss strokes.</em></p>
+
+<p align="center">
+  <img src="assets/comparison_6.png" alt="RFMSR text comparison 2" width="100%">
+</p>
+<p align="center"><em>Another text example (4×). RFMSR-1 achieves comparable fidelity to the 15-step model, demonstrating strong one-step distillation.</em></p>
+
+### Landscape & Nature
+
+<p align="center">
+  <img src="assets/comparison_4.png" alt="RFMSR landscape comparison" width="100%">
+</p>
+<p align="center"><em>Landscape super-resolution (4×). RFMSR recovers fine rock and grass textures without the blurriness or over-sharpening seen in competing methods.</em></p>
+
+
+## Output
+
+- Output files: `{input_name}_rfmsr.png`
+- Output directory: defaults to `outputs/` (configurable via `--output`)
+- Output size: `ceil(W × scale) × ceil(H × scale)`
+
+
+## Contact
+
+For questions or collaboration, please open an issue on GitHub.
+
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@article{rfmsr2026,
+  title={RFMSR: Residual Flow Matching for Image Super-Resolution},
+  author={},
+  journal={},
+  year={2026}
+}
+```
