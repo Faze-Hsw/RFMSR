@@ -1,38 +1,38 @@
-# RFMSR 推理配置 — Residual Flow Matching 逆流积分 (SD2.1 VAE)
+# RFMSR Inference Config — Residual Flow Matching Reverse Integration (SD2.1 VAE)
 
-# SD2.1 VAE 路径
+# SD2.1 VAE path
 vae_path: ckpts/stable-diffusion-2-1-base
 
-# RFMSR 路径
-rfmsr_path: ckpts/rfmsr.safetensors
+# RFMSR path
+rfmsr_path: ckpts/rfmsr_os.safetensors
 
-# DiT 架构配置 (与训练一致)
+# DiT architecture config (consistent with training)
 model_config: configs/rfmsr.yaml
 
-# Residual FM 噪声标准差
+# Residual FM noise std
 flow_sigma: 1.0
 
-# 逆流积分步数 (t: 1.0 → 0.0)
+# Reverse integration steps (t: 1.0 → 0.0)
 steps: 15
 
-# 放大倍数 (输出尺寸 = 原图 × scale)
+# Upscale factor (output size = input × scale)
 scale: 4.0
 
-# 随机种子
+# Random seed
 seed: 42
 
-# 输出目录
+# Output directory
 output: outputs
 
-# 设备
+# Device
 denoise_device: cuda
 
-# 颜色校正
-# 可选: 'adain' | 'wavelet' | 'ycbcr' | 'none'
+# Color correction
+# Options: 'adain' | 'wavelet' | 'ycbcr' | 'none'
 color_correction: 'wavelet'
 
-# 分块推理 (Latent tiling)
+# Tiled inference (Latent tiling)
 chopping:
   enabled: true
-  tile_size: 512       # 像素空间 tile 大小
-  tile_stride: 256     # 像素空间 stride
+  tile_size: 512       # Pixel-space tile size
+  tile_stride: 256     # Pixel-space stride

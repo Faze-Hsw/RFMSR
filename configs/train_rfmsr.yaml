@@ -1,9 +1,9 @@
-# RFMSR 训练配置 — LightningDiT
+# RFMSR Training Config — LightningDiT
 
-# ---- 模型架构（引用外部配置） ----
+# ---- Model architecture (references external config) ----
 model_config: configs/rfmsr.yaml
 
-# ---- 数据 ----
+# ---- Data ----
 data:
   hr_dir: traindata/
   degradation_config: configs/realesrgan_degradation.yaml
@@ -13,18 +13,18 @@ data:
   use_hflip: true
   use_rot: false
 
-# ---- SD2.1 VAE（冻结编解码） ----
+# ---- SD2.1 VAE (frozen encoder/decoder) ----
 vae_path: ckpts/stable-diffusion-2-1-base
 denoise_device: cuda
 
-# ---- VOSR 预训练权重（可选，用于初始化 LightningDiT 参数） ----
+# ---- VOSR pretrained weights (optional, for initializing LightningDiT params) ----
 pretrained_ckpt: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
 
-# ---- DINOv2（冻结，提取 LR 语义特征注入 DiT Cross-Attention） ----
+# ---- DINOv2 (frozen, extracts LR semantic features for DiT Cross-Attention) ----
 dinov2:
   enabled: true
 
-# ---- 训练 ----
+# ---- Training ----
 training:
   iterations: 10000
   lr: 5.0e-5
@@ -40,13 +40,13 @@ training:
 
 # ---- Residual Flow Matching ----
 flow:
-  sigma: 1.0          # 噪声标准差
-  time_dist: uniform  # 时间分布: uniform | lognorm
-  # lognorm 参数（仅 time_dist=lognorm 时生效）
+  sigma: 1.0          # noise std
+  time_dist: uniform  # time distribution: uniform | lognorm
+  # lognorm params (only effective when time_dist=lognorm)
   lognorm_mu: 0.0
   lognorm_sigma: 1.0
 
-# ---- 日志 & 保存 ----
+# ---- Logging & Saving ----
 experiment:
   name: rfmsr
   save_dir: experiments
@@ -54,12 +54,12 @@ experiment:
   save_freq: 1000
   keep_last_n: 3
 
-# ---- 验证 ----
+# ---- Validation ----
 validation:
   enabled: true
   lq_dir: assets/validate_lq
   gt_dir: assets/validate_gt
   scale: 4.0
-  steps: 15               # 推理步数
+  steps: 15               # inference steps
   seed: 42
-  max_images: 0           # 0 表示验证所有配对图片
+  max_images: 0           # 0 means validate all paired images

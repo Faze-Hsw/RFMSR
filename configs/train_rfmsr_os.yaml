@@ -1,4 +1,4 @@
-# RFMSR 一步训练配置 — T=1 直接生成, L2 + LPIPS + GAN 端到端损失
+# RFMSR One-Step Training Config — T=1 direct generation, L2 + LPIPS + GAN end-to-end loss
 
 model_config: configs/rfmsr.yaml
 
@@ -14,7 +14,7 @@ data:
 vae_path: ckpts/stable-diffusion-2-1-base
 denoise_device: cuda
 
-# 学生从预训练权重初始化
+# Student initialized from pretrained weights
 pretrained_ckpt: ckpts/rfmsr.safetensors
 
 dinov2:
@@ -36,25 +36,25 @@ training:
 flow:
   sigma: 1.0
 
-# 损失权重
+# Loss weights
 loss:
-  velo_weight: 1.0             # 速度监督 (ground-truth, 0 则关闭)
+  velo_weight: 1.0             # velocity supervision (ground-truth, 0 to disable)
   l2_weight: 0.0
   lpips_weight: 1.0
   lpips_net_type: 'vgg'       # 'alex', 'vgg', 'squeeze'
-  lpips_chunk_size: 1          # LPIPS 分块大小 (OOM 时减小; 设为 batch_size 则不分块)
+  lpips_chunk_size: 1          # LPIPS chunk size (reduce if OOM; set to batch_size to disable chunking)
   gan_weight: 0.1
   gan_type: 'hinge'            # 'vanilla', 'lsgan', 'wgan', 'wgan-gp', 'hinge'
 
 
-# 判别器 (潜空间 4ch)
+# Discriminator (latent space 4ch)
 discriminator:
   type: 'patch'                # 'patch', 'unet'
   ndf: 64
   n_layers: 3
   norm_type: 'spectral'
-  lr: 1.0e-4                   # 判别器学习率
-  update_freq: 2               # 每 N 有效步更新一次判别器
+  lr: 1.0e-4                   # discriminator learning rate
+  update_freq: 2               # update discriminator every N effective steps
 
 experiment:
   name: rfmsr_os
@@ -70,4 +70,4 @@ validation:
   scale: 4.0
   seed: 42
   max_images: 0
-  val_steps: [1, 15]          # 验证时同时跑 1-step 和 15-step Euler 推理
+  val_steps: [1, 15]          # run both 1-step and 15-step Euler inference during validation
