@@ -2,10 +2,7 @@
 
 # RFMSR: Residual Flow Matching for Image Super-Resolution
 
-<p align="center"><i>Residual Flow Matching in SD2.1 VAE Latent Space with LightningDiT.</i></p>
-
-
-[![HF-Model](https://img.shields.io/badge/🤗%20RFMSR-HuggingFace-FCC624.svg)](https://huggingface.co/CSWRY/RFMSR)
+[![HF-Model](https://img.shields.io/badge/🤗%20RFMSR-HuggingFace-FCC624.svg)](https://huggingface.co/frozen2001/RFMSR)
 
 </div>
 
@@ -25,7 +22,6 @@
 ### Hardware Requirements
 
 - **GPU VRAM**: >= 16 GB (recommended >= 24 GB for training)
-- **Disk**: >= 10 GB (model weights ~5.5 GB + training data)
 - Recommended: A100 / RTX 4090 / 3090
 
 ### Installation
@@ -38,45 +34,32 @@ conda create -n rfmsr python=3.12 -y
 conda activate rfmsr
 
 # 1. Install PyTorch (CUDA version)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 
 # 2. Install other dependencies
 pip install -r requirements.txt
+
+# 3. (Optional) Install xformers for memory-efficient attention
+pip install xformers
 ```
 
 ### Pretrained Weights
 
-Download pretrained weights into `ckpts/`:
-
-| File | Size | Description |
-|------|------|-------------|
-| `rfmsr.safetensors` | 1.81 GB | Multi-step Flow Matching checkpoint |
-| `rfmsr_os.safetensors` | 1.81 GB | One-step distillation checkpoint (recommended) |
-| `sd21_lwdecoder.pth` | 50 MB | SD2.1 lightweight decoder |
-| `stable-diffusion-2-1-base/` | — | SD2.1 VAE (auto-download via diffusers) |
-
-**Option A: HuggingFace (recommended)**
-
-Model weights are available at [CSWRY/RFMSR](https://huggingface.co/CSWRY/RFMSR) on HuggingFace.
+All pretrained weights are available at [frozen2001/RFMSR](https://huggingface.co/frozen2001/RFMSR). Download the `ckpts/` folder to the RFMSR project root.
 
 ```bash
-# Download ckpts from HuggingFace
-huggingface-cli login
-huggingface-cli download CSWRY/RFMSR ckpts/ --local-dir . --local-dir-use-symlinks False
+# 1. Install huggingface-cli
+pip install huggingface_hub
+
+# 2. Download the ckpts/ folder to RFMSR project root
+huggingface-cli download frozen2001/RFMSR ckpts/ --local-dir . --local-dir-use-symlinks False
 ```
 
-**Option B: Manual placement**
-
-```
-ckpts/
-├── rfmsr.safetensors
-├── rfmsr_os.safetensors
-├── sd21_lwdecoder.pth
-├── stable-diffusion-2-1-base/
-└── VOSR_0.5B_ms/
-    └── checkpoints/
-        └── ema_model.safetensors   # optional, for training init
-```
+| File | Description |
+|------|-------------|
+| `rfmsr.safetensors` | Phase I — multi-step Flow Matching model |
+| `rfmsr_os.safetensors` | Phase II — one-step model |
+| `rfmsr_consistency.safetensors` | Consistency distillation — one-step model |
 
 ### Data Preparation
 
@@ -103,14 +86,11 @@ Key configuration in `configs/train_rfmsr.yaml`:
 - RealESRGAN degradation pipeline (blur + noise + JPEG + resize)
 - Pretrained init from VOSR checkpoint (optional)
 
-Residual FM formulation:
-- Flow path: `x_t = z_hr + t * (z_lr - z_hr) + t * sigma * epsilon`
-- Target velocity: `v_gt = (z_lr - z_hr) + sigma * epsilon`
-- Network input: `cat(z_lr[4ch], x_t[4ch]) + DINOv2 Cross-Attention`
 
-### Stage 2: One-Step Distillation (L2 + LPIPS + GAN)
 
-Distill the multi-step model into a one-step generator with perceptual and adversarial losses:
+### Stage 2: One-Step Training
+
+Train a one-step generator with perceptual and adversarial losses:
 
 ```bash
 python train_rfmsr_os.py
@@ -119,7 +99,7 @@ python train_rfmsr_os.py
 Key configuration in `configs/train_rfmsr_os.yaml`:
 - Losses: velocity supervision + LPIPS (VGG) + Hinge GAN
 - PatchGAN discriminator in 4-channel latent space
-- Student initialized from `ckpts/rfmsr.safetensors`
+- Initialized from `ckpts/rfmsr.safetensors`
 - Validation runs both 1-step and 15-step inference for comparison
 
 
@@ -164,45 +144,13 @@ python infer_rfmsr.py --input ./test_images/ --scale 4.0 --steps 15
 | Multi-step (`rfmsr`) | 15 | Slower | Best | Maximum quality |
 
 
-## Model Architecture
+## Evaluation
 
-RFMSR uses a **LightningDiT** backbone operating in SD2.1 VAE latent space:
+Run the metrics script to compute PSNR, SSIM, LPIPS, DISTS, NIQE, MUSIQ, MANIQA, and CLIPIQA between SR results and GT images (paired by filename):
 
+```bash
+python utils/cal_metrics.py --gt_dir testdata/RealSR/HR --sr_dir outputs/RealSR
 ```
-Input: cat(z_lr[4ch], x_t[4ch]) → [B, 8, H, W]
-  ├── PatchEmbed (patch_size=2) → tokens [B, N, 1024]
-  ├── TimestepEmbedder (sinusoidal + MLP)
-  ├── LightningDiTBlock × 28
-  │     ├── Self-Attention + QK-Norm + RoPE
-  │     ├── Cross-Attention (DINOv2 semantic features)
-  │     ├── SwiGLU FFN
-  │     └── AdaLN (time-conditioned scale/shift)
-  └── FinalLayer → unpatchify → v [B, 4, H, W]
-```
-
-Key design choices:
-- RoPE positional encoding for spatial awareness
-- RMSNorm for stable training
-- DINOv2 frozen encoder (ViT-B) injects semantic features via Cross-Attention
-- SwiGLU activation in FFN layers
-- AdaLN modulation conditioned on timestep `t`
-
-Dependencies:
-- `diffusers` — SD2.1 VAE encoder/decoder (frozen)
-- `timm` — PatchEmbed
-- `torch.hub` — DINOv2 (facebookresearch/dinov2)
-- `basicsr` — RealESRGAN degradation
-
-
-## Evaluation Metrics
-
-The training script evaluates the following metrics during validation:
-
-- **PSNR** / **SSIM** — distortion-based metrics
-- **LPIPS** (Alex) — perceptual similarity
-- **DISTS** — deep image structure and texture similarity
-- **NIQE** — no-reference image quality
-- **MUSIQ** / **MANIQA** / **CLIPIQA** — transformer-based IQA
 
 
 ## Visual Comparisons
@@ -236,16 +184,22 @@ Below are qualitative comparisons on benchmark datasets. Each figure shows the l
 <p align="center"><em>Landscape super-resolution (4×). RFMSR recovers fine rock and grass textures without the blurriness or over-sharpening seen in competing methods.</em></p>
 
 
-## Output
 
-- Output files: `{input_name}_rfmsr.png`
-- Output directory: defaults to `outputs/` (configurable via `--output`)
-- Output size: `ceil(W × scale) × ceil(H × scale)`
 
 
 ## Contact
 
-For questions or collaboration, please open an issue on GitHub.
+For questions or collaboration, please open an issue on GitHub or contact [frozen2001@hust.edu.cn](mailto:frozen2001@hust.edu.cn).
+
+## Acknowledgements
+
+This project builds upon the following open-source works:
+
+- [VOSR](https://github.com/CSWRY/VOSR)
+- [Stable Diffusion 2.1](https://huggingface.co/Manojb/stable-diffusion-2-1-base)
+- [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
+- [LPIPS](https://github.com/richzhang/PerceptualSimilarity)
+- [BasicSR](https://github.com/XPixelGroup/BasicSR)
 
 ## Citation
 
