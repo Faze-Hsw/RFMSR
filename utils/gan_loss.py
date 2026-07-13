@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GAN Loss Functions
-移植自 LPNSR/losses/gan_loss.py
+Ported from LPNSR/losses/gan_loss.py
 
 Includes:
 1. PatchGAN discriminator (for adversarial training in image space)

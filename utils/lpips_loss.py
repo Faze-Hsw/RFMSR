@@ -1,6 +1,6 @@
 """
 LPIPS Perceptual Loss (Learned Perceptual Image Patch Similarity)
-移植自 LPNSR/losses/lpips_loss.py
+Ported from LPNSR/losses/lpips_loss.py
 
 Design Philosophy:
 LPIPS is a deep learning-based perceptual similarity metric that measures perceptual differences

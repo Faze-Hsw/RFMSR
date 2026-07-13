@@ -1,13 +1,13 @@
 """
-RFMSR 一步训练脚本 — T=1 直接生成，端到端损失
+RFMSR One-Step Training Script — T=1 direct generation, end-to-end losses
 
-训练目标: RFMSR 从 T=1 (z_lr + σ·ε) 一步预测 z_pred → z_hr
-损失组合:
-  - L2 损失 (潜空间): MSE(z_pred, z_hr)
-  - GAN 损失 (潜空间): PatchGAN/UNet 判别器区分 z_pred vs z_hr
-  - LPIPS 损失 (图像空间): VAE decode 后在像素空间计算感知损失
+Training objective: RFMSR predicts z_pred → z_hr from T=1 (z_lr + sigma*epsilon) in one step.
+Loss combination:
+  - L2 loss (latent space): MSE(z_pred, z_hr)
+  - GAN loss (latent space): PatchGAN/UNet discriminator distinguishing z_pred vs z_hr
+  - LPIPS loss (image space): perceptual loss computed in pixel space after VAE decode
 
-用法:
+Usage:
   python train_rfmsr_os.py
   python train_rfmsr_os.py --resume experiments/rfmsr_os/checkpoints/training_state_stepXXXXX.pth
 """
@@ -65,7 +65,7 @@ class RFMSROneStepTrainer:
         flow_cfg = self.cfg.get("flow", {})
         self.sigma = flow_cfg.get("sigma", 1.0)
 
-        # ---- 实验目录 ----
+        # ---- Experiment directory ----
         exp = self.cfg["experiment"]
         self.exp_dir = Path(exp["save_dir"])
         (self.exp_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
@@ -74,7 +74,7 @@ class RFMSROneStepTrainer:
         self.save_freq = exp["save_freq"]
         self.keep_last_n = exp.get("keep_last_n", 0)
 
-        # ---- 加载模块 ----
+        # ---- Load modules ----
         self._load_vae()
         self._load_dinov2()
         self._build_generator()
@@ -87,16 +87,16 @@ class RFMSROneStepTrainer:
         # AMP
         self.use_amp = self.cfg["training"]["use_amp"]
 
-        # 梯度累计
+        # Gradient accumulation
         tcfg = self.cfg["training"]
         self.accumulation_steps = tcfg.get("gradient_accumulation_steps", 1)
         self.grad_clip = tcfg.get("gradient_clip", 1.0)
 
-        # GAN 交替训练
+        # GAN alternating training
         disc_cfg = self.cfg["discriminator"]
         self.disc_update_freq = disc_cfg.get("update_freq", 2)
 
-        # 验证
+        # Validation
         self.val_enabled = self.cfg.get("validation", {}).get("enabled", False)
         self.lpips_fn = None
         self.psnr_metric = None
@@ -109,13 +109,13 @@ class RFMSROneStepTrainer:
         if self.val_enabled:
             self._init_val_metrics()
 
-        # 训练状态
+        # Training state
         self.global_step = 0
 
         self._print_summary()
 
     # ------------------------------------------------------------------
-    # 初始化
+    # Initialization
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -161,7 +161,7 @@ class RFMSROneStepTrainer:
         disc_cfg = self.cfg["discriminator"]
         self.discriminator = create_discriminator(
             disc_type=disc_cfg.get("type", "patch"),
-            input_nc=4,                          # 潜空间 4 通道
+            input_nc=4,                          # Latent space 4 channels
             ndf=disc_cfg.get("ndf", 64),
             n_layers=disc_cfg.get("n_layers", 3),
             norm_type=disc_cfg.get("norm_type", "spectral"),
@@ -170,7 +170,7 @@ class RFMSROneStepTrainer:
         print(f"✅ Discriminator ({disc_cfg.get('type','patch')}): {n_disc:.1f}K params")
 
     def _sample_t(self, B: int) -> torch.Tensor:
-        """随机采样 t ∈ [0,1] 用于速度监督训练。"""
+        """Randomly sample t ∈ [0,1] for velocity supervision training."""
         return torch.rand(B, device=self.device)
 
     def _build_losses(self):
@@ -181,7 +181,7 @@ class RFMSROneStepTrainer:
         self.lpips_weight = loss_cfg.get("lpips_weight", 1.0)
         self.gan_weight = loss_cfg.get("gan_weight", 0.1)
 
-        # LPIPS 分块解码：避免 VAE decode + LPIPS backbone 大 batch OOM
+        # LPIPS chunked decode: avoid VAE decode + LPIPS backbone OOM on large batch
         self.lpips_chunk_size = loss_cfg.get("lpips_chunk_size", None)
 
         self.gan_loss_fn = GANLoss(
@@ -219,7 +219,7 @@ class RFMSROneStepTrainer:
     def _build_dataloader(self):
         dcfg = self.cfg["data"]
         gt_size = dcfg["gt_size"]
-        assert gt_size % 16 == 0, f"gt_size={gt_size} 必须能被 16 整除"
+        assert gt_size % 16 == 0, f"gt_size={gt_size} must be divisible by 16"
         self.dataloader = create_train_dataloader(
             data_dir=dcfg["hr_dir"],
             config_path=dcfg["degradation_config"],
@@ -285,15 +285,15 @@ class RFMSROneStepTrainer:
 
     def vae_decode(self, latent: torch.Tensor) -> torch.Tensor:
         """[B,4,H/8,W/8] scaled latent → [B,3,H,W] float [0,1].
-        调用方按需自行包裹 torch.no_grad()。"""
+        Caller should wrap with torch.no_grad() as needed."""
         s = self.ae.config.scaling_factor
         decoded = self.ae.decode((latent / s).float()).sample
         return torch.clamp((decoded + 1.0) / 2.0, 0.0, 1.0)
 
     def vae_decode_checkpointed(self, latent: torch.Tensor) -> torch.Tensor:
-        """Gradient-checkpointed VAE decode for LPIPS 训练。
-        用 compute 换 memory：不保存 VAE decoder 的中间激活，
-        backward 时重新计算 forward，省 80%+ VAE decoder 显存。"""
+        """Gradient-checkpointed VAE decode for LPIPS training.
+        Trade compute for memory: discard VAE decoder intermediate activations,
+        recompute forward during backward, saving 80%+ VAE decoder VRAM."""
         s = self.ae.config.scaling_factor
         latent = latent / s
 
@@ -311,10 +311,10 @@ class RFMSROneStepTrainer:
 
     def train_step(self, batch: dict, train_disc: bool) -> dict:
         """
-        一步训练: RFMSR 从 T=1 直接预测终点。
+        One-step training: RFMSR directly predicts the endpoint from T=1.
 
-        train_disc=True  → 训练判别器
-        train_disc=False → 训练生成器
+        train_disc=True  → train discriminator
+        train_disc=False → train generator
         """
         device = self.device
 
@@ -332,17 +332,17 @@ class RFMSROneStepTrainer:
         if self.use_dinov2 and self.venc is not None:
             venc_fea = self.venc(lr)
 
-        # 3. T=1 初始化: x_1 = z_lr + σ·ε
+        # 3. T=1 initialization: x_1 = z_lr + sigma*epsilon
         epsilon = torch.randn_like(z_hr)
         x_1 = z_lr + self.sigma * epsilon
         t_ones = torch.ones(B, device=device)
 
-        # 4. 前向: v = f(x_1, t=1, z_lr)  →  z_pred = x_1 - v
+        # 4. Forward: v = f(x_1, t=1, z_lr) → z_pred = x_1 - v
         losses = {}
         inv_accum = 1.0 / self.accumulation_steps
 
         if train_disc:
-            # ================ 判别器步 ================
+            # ================ Discriminator step ================
             self.rfmsr.eval()
             self.discriminator.train()
 
@@ -369,16 +369,16 @@ class RFMSROneStepTrainer:
             self.rfmsr.train()
 
         else:
-            # ================ 生成器步 ================
+            # ================ Generator step ================
             self.rfmsr.train()
             self.discriminator.eval()
 
-            # ---- ① T=1 一步推理 (autocast 仅管 rfmsr 前向) ----
+            # ---- ① T=1 one-step inference (autocast only for rfmsr forward) ----
             with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
                 v = self.rfmsr(x_1, t_ones, z_lr, venc_fea=venc_fea)
                 z_pred = x_1.to(v.dtype) - v
 
-            # ★ loss 全部在 autocast 外, 统一 fp32 —— 彻底杜绝 backward 类型冲突
+            # ★ All losses outside autocast, unified fp32 — eliminates backward dtype conflicts
             z_pred = z_pred.float()
             z_hr_fp = z_hr.float() if z_hr.dtype != torch.float32 else z_hr
 
@@ -392,14 +392,14 @@ class RFMSROneStepTrainer:
                 gan_g_loss = self.gan_loss_fn(d_fake, target_is_real=True, is_disc=False)
                 total = total + self.gan_weight * gan_g_loss
 
-            # ---- ② Ground-truth 速度监督: v_true = z_lr - z_hr + σ·ε ----
+            # ---- ② Ground-truth velocity supervision: v_true = z_lr - z_hr + sigma*epsilon ----
             if self.velo_weight > 0:
                 t = self._sample_t(B)
                 t_expand = t[:, None, None, None]
                 residual = z_lr - z_hr
                 epsilon_rf = torch.randn_like(z_hr)
                 x_t = z_hr + t_expand * residual + t_expand * self.sigma * epsilon_rf
-                # 解析速度 (Residual Flow Matching ground-truth)
+                # Compute velocity (Residual Flow Matching ground-truth)
                 v_true = residual + self.sigma * epsilon_rf
 
                 with autocast(device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp):
@@ -408,7 +408,7 @@ class RFMSROneStepTrainer:
                 total = total + self.velo_weight * velo_loss
                 losses["Velo"] = velo_loss.item() * inv_accum
 
-            # ---- ③ LPIPS (图像空间, 分块解码, gradient-checkpointed) ----
+            # ---- ③ LPIPS (image space, chunked decode, gradient-checkpointed) ----
             if self.lpips_weight > 0:
                 chunk_sz = self.lpips_chunk_size or B
                 lpips_loss = torch.zeros((), device=device)
@@ -434,13 +434,13 @@ class RFMSROneStepTrainer:
                 losses["GAN_G"] = gan_g_loss.item() * inv_accum
             losses["total"] = total.item() * inv_accum
 
-        # 5. 反向传播
+        # 5. Backward pass
         loss.backward()
 
         return losses
 
     # ------------------------------------------------------------------
-    # EMA (仅对生成器)
+    # EMA (generator only)
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -461,12 +461,12 @@ class RFMSROneStepTrainer:
         ckpt_dir = self.exp_dir / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # 推理权重 (safetensors)
+        # Inference weights (safetensors)
         weights = self.ema_state if self.ema_state is not None else self.rfmsr.state_dict()
         ema_path = ckpt_dir / f"rfmsr_os_step{step}.safetensors"
         safe_save(weights, ema_path)
 
-        # 完整训练状态 (torch.save)
+        # Full training state (torch.save)
         state = {
             "step": step,
             "rfmsr": self.rfmsr.state_dict(),
@@ -499,7 +499,7 @@ class RFMSROneStepTrainer:
             print(f"🗑️  Removed old checkpoint: step {step}")
 
     # ------------------------------------------------------------------
-    # 验证 (一步推理)
+    # Validation (one-step inference)
     # ------------------------------------------------------------------
 
     def _init_val_metrics(self):
@@ -525,7 +525,7 @@ class RFMSROneStepTrainer:
 
     @torch.no_grad()
     def _validate_inference(self, z_lr, venc_fea, val_seed, n_steps):
-        """执行 N 步 Euler 积分推理, 返回解码后的 [0,1] 图像 tensor。"""
+        """Run N-step Euler integration inference, return decoded [0,1] image tensor."""
         B_v = z_lr.shape[0]
         generator = torch.Generator(device=self.device).manual_seed(val_seed)
         x = z_lr + self.sigma * torch.randn(
@@ -544,7 +544,7 @@ class RFMSROneStepTrainer:
         return torch.clamp((decoded + 1.0) / 2.0, 0.0, 1.0)
 
     def _compute_val_metrics(self, sr_decoded, gt_tensor, metrics_dict):
-        """将当前图片的指标 append 到对应 list。"""
+        """Append current image metrics to the corresponding lists."""
         if self.psnr_metric is not None:
             metrics_dict["psnr"].append(self.psnr_metric(sr_decoded, gt_tensor).mean().item())
         if self.ssim_metric is not None:
@@ -566,7 +566,7 @@ class RFMSROneStepTrainer:
 
     @torch.no_grad()
     def validate(self, step: int):
-        """验证：同时跑 1-step 和多步推理, 对比性能。"""
+        """Validate: run both 1-step and multi-step inference, compare performance."""
         self.rfmsr.eval()
 
         orig_state = None
@@ -683,7 +683,7 @@ class RFMSROneStepTrainer:
         self.rfmsr.train()
 
     # ------------------------------------------------------------------
-    # 续训
+    # Resume training
     # ------------------------------------------------------------------
 
     def load_checkpoint(self, path: str):
@@ -710,7 +710,7 @@ class RFMSROneStepTrainer:
         print(f"✅ Resumed from step {self.global_step}")
 
     # ------------------------------------------------------------------
-    # 主训练循环
+    # Main training loop
     # ------------------------------------------------------------------
 
     def train(self):
@@ -728,14 +728,14 @@ class RFMSROneStepTrainer:
             bar_format="{desc} [{n:>6d}/{total_fmt}] {percentage:3.0f}% |{bar}| {postfix} [{rate_fmt}]",
         )
 
-        # EMA 统计
+        # EMA stats
         ema_velo = 0.0; ema_l2 = 0.0; ema_lpips = 0.0
         ema_gan_g = 0.0; ema_gan_d = 0.0
         ema_cnt_g = 0; ema_cnt_d = 0
 
-        # 独立的 G/D 梯度累计计数器
+        # Independent G/D gradient accumulation counters
         g_count = 0; d_count = 0
-        # G/D 交替用 batch 级计数器 (不受 accumulation 影响; 续训从 0 重启)
+        # G/D alternating batch-level counter (unaffected by accumulation; restarts from 0 on resume)
         batch_idx = 0
 
         self.optimizer_g.zero_grad()
@@ -752,13 +752,13 @@ class RFMSROneStepTrainer:
                     data_iter = iter(self.dataloader)
                     batch = next(data_iter)
 
-                # G/D 交替: batch 级 (不受 accumulation 影响)
+                # G/D alternating: batch-level (unaffected by accumulation)
                 train_d = (self.gan_weight > 0 and batch_idx % self.disc_update_freq == 0)
                 batch_idx += 1
 
                 loss_dict = self.train_step(batch, train_disc=train_d)
 
-                # EMA & 累计
+                # EMA & accumulate
                 if train_d:
                     ema_gan_d += loss_dict.get("D", 0)
                     ema_cnt_d += 1
@@ -771,7 +771,7 @@ class RFMSROneStepTrainer:
                     ema_cnt_g += 1
                     g_count += 1
 
-                # ---- G/D 独立梯度累计 ----
+                # ---- G/D independent gradient accumulation ----
                 stepped = False
 
                 if g_count >= accum_steps:
@@ -793,7 +793,7 @@ class RFMSROneStepTrainer:
                     stepped = True
 
                 if stepped:
-                    # 进度条
+                    # Progress bar
                     postfix = {}
                     if ema_cnt_g > 0:
                         if ema_velo > 0:
@@ -806,7 +806,7 @@ class RFMSROneStepTrainer:
                     pbar.set_postfix(**postfix)
                     pbar.update(1)
 
-                    # 日志 (避免 G/D 连续 step 时重复打印)
+                    # Logging (avoid duplicate prints on consecutive G/D steps)
                     if self.global_step // self.log_freq > last_log_step // self.log_freq:
                         last_log_step = self.global_step
                         lr_g = self.optimizer_g.param_groups[0]['lr']
@@ -825,7 +825,7 @@ class RFMSROneStepTrainer:
                         ema_velo = ema_l2 = ema_lpips = ema_gan_g = ema_gan_d = 0.0
                         ema_cnt_g = ema_cnt_d = 0
 
-                    # 保存 (避免 G/D 连续 step 时重复保存)
+                    # Save (avoid duplicate saves on consecutive G/D steps)
                     if self.global_step // self.save_freq > last_save_step // self.save_freq:
                         last_save_step = self.global_step
                         self.save_checkpoint(self.global_step)
@@ -846,7 +846,7 @@ class RFMSROneStepTrainer:
 
 
 # =========================================================================
-# CLI 入口
+# CLI entry
 # =========================================================================
 
 def main():

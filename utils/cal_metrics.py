@@ -1,12 +1,12 @@
 """
-计算 SR 结果与 GT 的 PSNR / SSIM / LPIPS / DISTS / NIQE / MUSIQ / FID / MANIQA / CLIPIQA。
+Compute PSNR / SSIM / LPIPS / DISTS / NIQE / MUSIQ / FID / MANIQA / CLIPIQA between SR results and GT.
 
-配对逻辑：SR 文件名 == GT 文件名（纯文件名匹配，不递归子目录）。
+Pairing logic: SR filename == GT filename (flat filename match, no recursive subdirectory search).
 
-用法:
+Usage:
     python utils/cal_metrics.py --gt_dir testdata/RealSR/HR --sr_dir outputs/RealSR
 
-依赖:
+Dependencies:
     pip install pyiqa lpips
 """
 
@@ -49,7 +49,7 @@ except Exception:
 
 
 def scan_flat(dir_path: Path, exts: list[str]) -> list[Path]:
-    """扫描目录下所有图片（不递归），按文件名排序。"""
+    """Scan all images in a directory (flat, non-recursive), sorted by filename."""
     files = []
     for ext in exts:
         for pattern in [f"*.{ext}", f"*.{ext.upper()}"]:
@@ -59,7 +59,7 @@ def scan_flat(dir_path: Path, exts: list[str]) -> list[Path]:
 
 
 class PairDataset(Dataset):
-    """通过文件名将 SR 与 GT 一一配对。"""
+    """Pair SR and GT images by filename."""
 
     def __init__(self, sr_dir: str, gt_dir: str, exts: list[str] = None):
         if exts is None:
