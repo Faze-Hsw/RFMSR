@@ -1,6 +1,6 @@
 """
 RealESRGAN Image Degradation Pipeline
-基于 basicsr 官方实现，需要安装: pip install basicsr
+Based on the official basicsr implementation. Install: pip install basicsr
 """
 
 import math
@@ -15,8 +15,8 @@ import torchvision.transforms.functional as tv_F
 import yaml
 from typing import Dict, Optional, Tuple
 
-# ---- compatibility: basicsr 依赖 torchvision.transforms.functional_tensor ----
-# torchvision >= 0.15 已移除该模块，需要创建兼容 shim
+# ---- compatibility: basicsr depends on torchvision.transforms.functional_tensor ----
+# torchvision >= 0.15 removed this module, need to create a compatibility shim
 if 'torchvision.transforms.functional_tensor' not in sys.modules:
     _ft = ModuleType('torchvision.transforms.functional_tensor')
     _ft.rgb_to_grayscale = tv_F.rgb_to_grayscale
@@ -33,7 +33,7 @@ from basicsr.data.degradations import (
 
 
 class RealESRGANDegradation:
-    """RealESRGAN 二阶段退化管线"""
+    """RealESRGAN two-stage degradation pipeline"""
 
     def __init__(self, config_path: str):
         self.config = self._load_config(config_path)
@@ -63,7 +63,7 @@ class RealESRGANDegradation:
     # Kernel generation
     # ------------------------------------------------------------------
     def generate_kernels(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """生成一阶 blur kernel、二阶 blur kernel、final sinc kernel"""
+        """Generate first-order blur kernel, second-order blur kernel, final sinc kernel"""
 
         # --- first blur kernel ---
         kernel_size = random.choice(self.kernel_range1)
@@ -122,7 +122,7 @@ class RealESRGANDegradation:
         sinc_kernel: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        对 HR 图像施加 RealESRGAN 二阶段退化。
+        Apply RealESRGAN two-stage degradation to HR image.
 
         Args:
             img_gt: [B, C, H, W], float32, [0, 1]

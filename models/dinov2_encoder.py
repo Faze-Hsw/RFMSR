@@ -1,9 +1,9 @@
 """
-DINOv2 编码器 — 冻结，从 LR 图片提取语义特征注入 DiT Cross-Attention。
+DINOv2 Encoder — frozen, extracts semantic features from LR images for DiT Cross-Attention.
 
-使用 torch.hub 下载权重（与 VOSR 一致），缓存至 ckpts/torch_cache。
+Downloads weights via torch.hub (consistent with VOSR), cached to ckpts/torch_cache.
 
-用法:
+Usage:
     encoder = create_dinov2_encoder("configs/rfmsr.yaml", device="cuda")
     features = encoder(lr_tensor)  # lr: [B,3,H,W] float [0,1] → list[[B,N,enc_dim]]
 """
@@ -26,7 +26,7 @@ DINOV2_HUB_NAMES = {
 
 
 class Dinov2Encoder(nn.Module):
-    """冻结的 DINOv2 特征提取器，输出指定中间层特征。"""
+    """Frozen DINOv2 feature extractor, outputting features from specified intermediate layers."""
 
     def __init__(
         self,
@@ -47,7 +47,7 @@ class Dinov2Encoder(nn.Module):
                 f"expected one of {list(DINOV2_HUB_NAMES)}"
             )
 
-        # 设置 torch.hub 缓存目录（与 VOSR 一致）
+        # Set torch.hub cache directory (consistent with VOSR)
         cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                                  "ckpts", "torch_cache")
         os.makedirs(cache_dir, exist_ok=True)
@@ -56,11 +56,11 @@ class Dinov2Encoder(nn.Module):
         print(f"Loading DINOv2 from torch.hub: facebookresearch/dinov2 → {hub_name} ...")
         encoder = torch.hub.load('facebookresearch/dinov2', hub_name)
 
-        # 去掉分类头，替换为 Identity
+        # Remove classification head, replace with Identity
         del encoder.head
         encoder.head = torch.nn.Identity()
 
-        # 注入 forward_with_features 方法（与 VOSR 完全一致）
+        # Inject forward_with_features method (identical to VOSR)
         def forward_with_features(self, x, masks=None):
             features = {}
             layer_indices = list(range(len(self.blocks)))
@@ -70,7 +70,7 @@ class Dinov2Encoder(nn.Module):
             for i, blk in enumerate(self.blocks):
                 x = blk(x)
                 if i in layer_indices:
-                    features[f'layer_{i}'] = x[:, 1:]  # 去掉 CLS token
+                    features[f'layer_{i}'] = x[:, 1:]  # Remove CLS token
             x_norm = self.norm(x)
             return features, x_norm[:, 1:]
 
@@ -85,7 +85,7 @@ class Dinov2Encoder(nn.Module):
     def preprocess(self, lr: torch.Tensor) -> torch.Tensor:
         """
         lr: [B, 3, H, W] float [0, 1]
-        → resize → clamp → ImageNet 标准化
+        → resize → clamp → ImageNet normalization
         """
         x = F.interpolate(lr, size=self.dinov2_size, mode="bicubic", align_corners=False)
         x = x.clamp(0, 1)
@@ -96,7 +96,7 @@ class Dinov2Encoder(nn.Module):
     def forward(self, lr: torch.Tensor) -> list[torch.Tensor]:
         """
         lr: [B, 3, H, W] float [0, 1]
-        → list of [B, N_patches, enc_dim]  每个 tensor 对应 layer_indices 中的一个指定层
+        → list of [B, N_patches, enc_dim]  each tensor corresponds to one specified layer in layer_indices
         """
         x = self.preprocess(lr)
 
@@ -109,7 +109,7 @@ class Dinov2Encoder(nn.Module):
 
 
 def create_dinov2_encoder(config_path: str, device: str = "cuda") -> Dinov2Encoder | None:
-    """从 YAML 配置创建 DINOv2 编码器，如未配置则返回 None。"""
+    """Create DINOv2 encoder from YAML config, returns None if not configured."""
     import yaml
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)

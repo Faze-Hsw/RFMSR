@@ -1,15 +1,15 @@
 """
-RFMSR — Residual Flow Matching DiT (SD2.1 VAE 潜空间)
+RFMSR — Residual Flow Matching DiT (SD2.1 VAE latent space)
 
-输入:
-  z_lr [B, 4, H, W]    LR latent (VAE encode 上采样 LR)
-  x_t  [B, 4, H, W]    当前流状态
-  t    [B]              时间 ∈ [0,1]
+Input:
+  z_lr [B, 4, H, W]    LR latent (VAE-encoded upscaled LR)
+  x_t  [B, 4, H, W]    current flow state
+  t    [B]              time ∈ [0,1]
 
-输出:
-  v    [B, 4, H, W]     速度预测
+Output:
+  v    [B, 4, H, W]     velocity prediction
 
-架构:
+Architecture:
   cat(z_lr, x_t) → [B, 8, H, W]
     → PatchEmbed(patch_size=2) → tokens [B, N, 1024]
     → LightningDiT × 28 blocks
@@ -72,10 +72,10 @@ class RFMSR(nn.Module):
         )
 
     def load_pretrained(self, ckpt_path: str, verbose: bool = True):
-        """从 VOSR 预训练权重初始化 RFMSR（兼容 key 前缀和 pos_embed 尺寸差异）。
+        """Initialize RFMSR from VOSR pretrained weights (handles key prefix and pos_embed size mismatch).
 
-        VOSR checkpoint 的 key 为裸 LightningDiT (如 blocks.0.attn.qkv.weight)，
-        RFMSR 内部用 self.dit 包裹，key 多了 dit. 前缀，此处自动匹配。
+        VOSR checkpoint keys are raw LightningDiT keys (e.g. blocks.0.attn.qkv.weight),
+        while RFMSR wraps them under self.dit with a dit. prefix; this method handles that automatically.
         """
         if ckpt_path.endswith(".safetensors"):
             state_dict = safetensors_load(ckpt_path)
@@ -87,7 +87,7 @@ class RFMSR(nn.Module):
         skipped = 0
         loaded = 0
 
-        # 自动检测是否需要 dit. 前缀
+        # Auto-detect whether dit. prefix is needed
         need_prefix = "dit." if any(k.startswith("dit.") for k in target_state) else ""
 
         for k, v in state_dict.items():
@@ -100,10 +100,10 @@ class RFMSR(nn.Module):
                 if verbose and skipped <= 3:
                     print(f"[RFMSR] Skipping {k} (not in model)")
                 continue
-            # 跳过 RoPE/freqs（模型会根据当前 input_size 自动生成）
+            # Skip RoPE/freqs (the model auto-generates them based on current input_size)
             if "rope" in k or "freqs_cos" in k or "freqs_sin" in k:
                 continue
-            # pos_embed 尺寸不匹配时 bicubic 插值
+            # Bicubic interpolation when pos_embed size mismatches
             if "pos_embed" in target_k and v.shape != target_state[target_k].shape:
                 if verbose:
                     print(f"[RFMSR] Interpolating pos_embed: {v.shape} → {target_state[target_k].shape}")
@@ -134,20 +134,20 @@ class RFMSR(nn.Module):
                 venc_fea=None) -> torch.Tensor:
         """
         Args:
-            x_t:  [B, 4, H, W]   当前流状态
-            t:    [B]             时间
-            z_lr: [B, 4, H, W]   LR latent（channel-concat 条件）
-            venc_fea: DINOv2 特征列表 [tensor[B,N,C]] 或 None（Cross-Attn 条件）
+            x_t:  [B, 4, H, W]   current flow state
+            t:    [B]             time
+            z_lr: [B, 4, H, W]   LR latent (channel-concat condition)
+            venc_fea: DINOv2 feature list [tensor[B,N,C]] or None (Cross-Attn condition)
 
         Returns:
-            v:    [B, 4, H, W]   速度预测
+            v:    [B, 4, H, W]   velocity prediction
         """
         inp = torch.cat([z_lr, x_t], dim=1)  # [B, 8, H, W]
         return self.dit.forward_flexible(inp, t, z=venc_fea)
 
 
 def create_rfmsr(cfg_path: str) -> RFMSR:
-    """从 YAML 配置文件创建 RFMSR。"""
+    """Create RFMSR from YAML config file."""
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 

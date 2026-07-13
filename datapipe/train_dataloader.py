@@ -6,7 +6,7 @@ Used to load image datasets and apply RealESRGAN degradation pipeline to generat
 import os
 import sys
 
-# 确保项目根目录在 sys.path 中，使 datapipe 包可被导入
+# Ensure project root is in sys.path so that the datapipe package can be imported
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
