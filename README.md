@@ -2,6 +2,7 @@
 
 # RFMSR: Residual Flow Matching for Image Super-Resolution
 
+[![Paper](https://img.shields.io/badge/arXiv-2607.12753-b31b1b.svg)](https://arxiv.org/abs/2607.12753)
 [![HF-Model](https://img.shields.io/badge/🤗%20RFMSR-HuggingFace-FCC624.svg)](https://huggingface.co/frozen2001/RFMSR)
 
 </div>
