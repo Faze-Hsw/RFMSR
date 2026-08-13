@@ -1,5 +1,6 @@
 diffusers>=0.27.0
 einops>=0.6
+timm
 numpy<2.0
 pillow
 safetensors>=0.3

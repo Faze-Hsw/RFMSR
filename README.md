@@ -53,7 +53,7 @@ All pretrained weights are available at [frozen2001/RFMSR](https://huggingface.c
 pip install huggingface_hub
 
 # 2. Download the ckpts/ folder to RFMSR project root
-huggingface-cli download frozen2001/RFMSR ckpts/ --local-dir . --local-dir-use-symlinks False
+huggingface-cli download frozen2001/RFMSR ckpts --local-dir .
 ```
 
 | File | Description |
