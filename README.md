@@ -209,7 +209,7 @@ If you find this work useful, please cite:
 ```bibtex
 @misc{huang2026rfmsrresidualflowmatching,
       title={RFMSR: Residual Flow Matching for Image Super-Resolution},
-      author={Shuwei Huang and Tianyao Luo and Jicheng Liu and Daizong Liu and Pan Zhou},
+      author={Shuwei Huang and Tianyao Luo and Jicheng Liu and Pan Zhou},
       year={2026},
       eprint={2607.12753},
       archivePrefix={arXiv},
