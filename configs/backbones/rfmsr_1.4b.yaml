@@ -1,0 +1,40 @@
+# =============================================================================
+# Backbone: 1.4B (LightningDiT, 16-channel latent space)
+# =============================================================================
+
+name: rfmsr_1.4b
+
+# DiT initialization weights
+pretrained_ckpt: ckpts/VOSR_1.4B_ms/checkpoints/ema_model.safetensors
+
+# ---- VAE ----
+ae:
+  type: qwen                    # sd2: 4ch + scalar scaling_factor | qwen: 16ch + per-channel mean/std
+  path: ckpts/Qwen-Image-vae-2d
+  subfolder: ~                  # sd2 only; the qwen folder is the VAE root itself
+  latent_channels: 16
+
+# ---- DiT ----
+dit_arch:
+  input_size: 64                # latent side length (512 / 8)
+  patch_size: 2
+  in_channels: 32               # = 2 * latent_channels (z_lr and x_t concatenated)
+  out_channels: 16              # = latent_channels (velocity field)
+  hidden_size: 1536
+  depth: 36
+  num_heads: 24
+  mlp_ratio: 4.0
+  use_qknorm: true
+  use_swiglu: true
+  use_rope: true
+  use_rmsnorm: true
+  wo_shift: false
+  use_checkpoint: true
+
+# ---- DINOv2 semantic conditioning (Cross-Attention) ----
+dinov2:
+  enc_type: dinov2l             # dinov2b(768) / dinov2l(1024) / dinov2g(1536)
+  enc_dim: 1024
+  dinov2_size: 448
+  layer_dinov2b_list: [17]      # ViT-L has 24 blocks; use block 17
+  encdim_ratio: 3

@@ -26,7 +26,9 @@ from tqdm import tqdm
 from safetensors.torch import load_file as safe_load
 from models.rfmsr import create_rfmsr
 from models.dinov2_encoder import create_dinov2_encoder
+from models.latent_codec import create_latent_codec
 from utils.color_fix import apply_color_fix
+from utils.config_loader import load_config
 
 
 # ================================================================================
@@ -36,20 +38,12 @@ from utils.color_fix import apply_color_fix
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _CONFIG_PATH = os.path.join(_SCRIPT_DIR, "configs", "infer_rfmsr.yaml")
 
+_CFG = load_config(_CONFIG_PATH, root=_SCRIPT_DIR)
+_AE_CFG = _CFG.get("ae") or {}
 
-def load_config() -> dict:
-    if not os.path.exists(_CONFIG_PATH):
-        print(f"Config file {_CONFIG_PATH} not found, using built-in defaults")
-        return {}
-    with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-_CFG = load_config()
-
-VAE_PATH = _CFG.get("vae_path", "ckpts/stable-diffusion-2-1-base")
-RFMSR_PATH = _CFG.get("rfmsr_path", "ckpts/rfmsr.safetensors")
-MODEL_CONFIG = _CFG.get("model_config", "configs/rfmsr.yaml")
+VAE_PATH = _CFG.get("vae_path") or _AE_CFG.get("path") or "ckpts/stable-diffusion-2-1-base"
+RFMSR_PATH = _CFG.get("rfmsr_path", "ckpts/RFMSR_0.5B/rfmsr.safetensors")
+MODEL_CONFIG = _CFG.get("model_config", os.path.join(_SCRIPT_DIR, "configs", "backbones", "rfmsr_0.5b.yaml"))
 FLOW_SIGMA = _CFG.get("flow_sigma", 1.0)
 INFER_STEPS = _CFG.get("steps", 28)
 SCALE = _CFG.get("scale", 4.0)
@@ -76,21 +70,19 @@ class RFMSRInferencer:
 
     # ---- Model loading ----
 
-    def load(self, vae_path=None, rfmsr_path=None, model_config=None, denoise_device=None):
-        """Load SD2.1 VAE + RFMSR + DINOv2. CLI args override YAML defaults."""
-        from diffusers import AutoencoderKL
-
-        _vae = vae_path or VAE_PATH
+    def load(self, vae_path=None, rfmsr_path=None, model_config=None, denoise_device=None, backbone=None):
+        """Load VAE + RFMSR + DINOv2. CLI args override YAML defaults."""
         _rfmsr = rfmsr_path or RFMSR_PATH
-        _model = model_config or MODEL_CONFIG
         _device = denoise_device or DENOISE_DEVICE
         self._device = _device
 
-        print(f"Loading SD2.1 VAE from {_vae} -> {_device}...")
-        self.ae = AutoencoderKL.from_pretrained(_vae, subfolder="vae")
-        self.ae = self.ae.to(_device).eval()
-        self.ae.requires_grad_(False)
-        print(f"  VAE scaling_factor: {self.ae.config.scaling_factor}")
+        # backbone is the architecture source; model_config points at a file with dit_arch/dinov2/ae
+        cfg = load_config(model_config or _CONFIG_PATH, root=_SCRIPT_DIR, backbone=backbone)
+        _model = cfg.get("model_config") or MODEL_CONFIG
+        ae_cfg = dict(cfg.get("ae") or _AE_CFG)
+        ae_cfg["path"] = vae_path or ae_cfg.get("path") or VAE_PATH
+        self.codec = create_latent_codec(ae_cfg, device=_device)
+        print(f"  VAE: {self.codec}")
 
         print(f"Loading RFMSR from {_rfmsr} ...")
         self.rfmsr = create_rfmsr(_model)
@@ -119,13 +111,12 @@ class RFMSRInferencer:
     # ---- VAE encode/decode ----
 
     def vae_encode(self, img: torch.Tensor) -> torch.Tensor:
-        """img [-1,1] → SD2.1 latent [B,4,H,W] (scaled)."""
-        return self.ae.encode(img.float()).latent_dist.sample() * self.ae.config.scaling_factor
+        """img [-1,1] -> normalized latent [B,C,H/8,W/8]."""
+        return self.codec.encode(img.float())
 
     def vae_decode(self, latent: torch.Tensor) -> torch.Tensor:
-        """SD2.1 latent [B,4,H,W] (scaled) → pixel [0,1]."""
-        latent = latent / self.ae.config.scaling_factor
-        img = self.ae.decode(latent).sample
+        """Normalized latent [B,C,H/8,W/8] -> pixels [0,1]."""
+        img = self.codec.decode(latent)
         return torch.clamp((img + 1.0) / 2.0, min=0.0, max=1.0)
 
     # ---- Tile helpers ----
@@ -362,6 +353,7 @@ def main(
     vae_path: str = None,
     rfmsr_path: str = None,
     model_config: str = None,
+    backbone: str = None,
     denoise_device: str = None,
 ):
     """RFMSR Residual Flow Matching super-resolution inference.
@@ -380,6 +372,7 @@ def main(
         vae_path:        SD2.1 VAE path (default from config)
         rfmsr_path:      RFMSR weight path (default from config)
         model_config:    DiT architecture config path (default from config)
+        backbone:        Backbone config path, e.g. configs/backbones/rfmsr_1.4b.yaml
         denoise_device:  Inference device (default from config)
     """
     init_image = input
@@ -418,8 +411,8 @@ def main(
     print(f"{'=' * 50}\n")
 
     inferencer = RFMSRInferencer()
-    inferencer.load(vae_path=vae_path, rfmsr_path=rfmsr_path,
-                    model_config=model_config, denoise_device=denoise_device)
+    inferencer.load(vae_path=vae_path, rfmsr_path=rfmsr_path, model_config=model_config,
+                    denoise_device=denoise_device, backbone=backbone)
 
     out_root = Path(output)
     pbar = tqdm(img_files, desc="Inference", unit="img")

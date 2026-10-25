@@ -1,13 +1,10 @@
-# RFMSR Inference Config — Residual Flow Matching Reverse Integration (SD2.1 VAE)
+# RFMSR Inference Config — Residual Flow Matching Reverse Integration
 
-# SD2.1 VAE path
-vae_path: ckpts/stable-diffusion-2-1-base
+# Backbone (architecture + VAE + DINOv2)
+backbone: configs/backbones/rfmsr_0.5b.yaml
 
-# RFMSR path
-rfmsr_path: ckpts/rfmsr_os.safetensors
-
-# DiT architecture config (consistent with training)
-model_config: configs/rfmsr.yaml
+# RFMSR weights (must match the backbone size)
+rfmsr_path: ckpts/RFMSR_0.5B/rfmsr_os.safetensors
 
 # Residual FM noise std
 flow_sigma: 1.0

@@ -1,0 +1,40 @@
+# =============================================================================
+# Backbone: 0.5B (LightningDiT, SD2.1 4-channel latent space)
+# =============================================================================
+
+name: rfmsr_0.5b
+
+# DiT initialization weights
+pretrained_ckpt: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
+
+# ---- VAE ----
+ae:
+  type: sd2                     # sd2: 4ch + scalar scaling_factor | qwen: 16ch + per-channel mean/std
+  path: ckpts/stable-diffusion-2-1-base
+  subfolder: vae                # sd2 only
+  latent_channels: 4
+
+# ---- DiT ----
+dit_arch:
+  input_size: 64                # latent side length (512 / 8)
+  patch_size: 2
+  in_channels: 8                # = 2 * latent_channels (z_lr and x_t concatenated)
+  out_channels: 4               # = latent_channels (velocity field)
+  hidden_size: 1024
+  depth: 28
+  num_heads: 16
+  mlp_ratio: 4.0
+  use_qknorm: true
+  use_swiglu: true
+  use_rope: true
+  use_rmsnorm: true
+  wo_shift: false
+  use_checkpoint: true
+
+# ---- DINOv2 semantic conditioning (Cross-Attention) ----
+dinov2:
+  enc_type: dinov2b             # dinov2b(768) / dinov2l(1024) / dinov2g(1536)
+  enc_dim: 768
+  dinov2_size: 448
+  layer_dinov2b_list: [8]       # ViT-B has 12 blocks; use block 8
+  encdim_ratio: 3

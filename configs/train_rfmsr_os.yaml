@@ -1,6 +1,7 @@
 # RFMSR One-Step Training Config — T=1 direct generation, L2 + LPIPS + GAN end-to-end loss
 
-model_config: configs/rfmsr.yaml
+# ---- Backbone (architecture + VAE + DINOv2 all come from that file) ----
+backbone: configs/backbones/rfmsr_0.5b.yaml
 
 data:
   hr_dir: traindata/
@@ -11,11 +12,11 @@ data:
   use_hflip: true
   use_rot: false
 
-vae_path: ckpts/stable-diffusion-2-1-base
 denoise_device: cuda
 
-# Student initialized from pretrained weights
-pretrained_ckpt: ckpts/rfmsr.safetensors
+# Must be a checkpoint of matching size when switching backbones
+# (leave empty to fall back to the backbone's pretrained_ckpt).
+pretrained_ckpt: ckpts/RFMSR_0.5B/rfmsr.safetensors
 
 dinov2:
   enabled: true

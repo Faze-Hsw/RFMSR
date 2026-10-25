@@ -1,7 +1,8 @@
 diffusers>=0.27.0
 einops>=0.6
 timm
-numpy<2.0
+numpy>=2.0,<2.3
+scipy>=1.14,<1.16
 pillow
 safetensors>=0.3
 tqdm
@@ -9,8 +10,7 @@ fire
 pyyaml
 huggingface_hub>=0.23.0
 requests
-invisible-watermark
 basicsr>=1.4.2
-opencv-python
+opencv-python>=4.10
 lpips
 pyiqa

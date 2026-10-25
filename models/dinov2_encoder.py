@@ -4,7 +4,7 @@ DINOv2 Encoder — frozen, extracts semantic features from LR images for DiT Cro
 Downloads weights via torch.hub (consistent with VOSR), cached to ckpts/torch_cache.
 
 Usage:
-    encoder = create_dinov2_encoder("configs/rfmsr.yaml", device="cuda")
+    encoder = create_dinov2_encoder("configs/backbones/rfmsr_0.5b.yaml", device="cuda")
     features = encoder(lr_tensor)  # lr: [B,3,H,W] float [0,1] → list[[B,N,enc_dim]]
 """
 

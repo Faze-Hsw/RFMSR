@@ -1,7 +1,7 @@
 # RFMSR Training Config — LightningDiT
 
-# ---- Model architecture (references external config) ----
-model_config: configs/rfmsr.yaml
+# ---- Backbone (architecture + VAE + DINOv2 all come from that file) ----
+backbone: configs/backbones/rfmsr_0.5b.yaml
 
 # ---- Data ----
 data:
@@ -13,12 +13,7 @@ data:
   use_hflip: true
   use_rot: false
 
-# ---- SD2.1 VAE (frozen encoder/decoder) ----
-vae_path: ckpts/stable-diffusion-2-1-base
 denoise_device: cuda
-
-# ---- VOSR pretrained weights (optional, for initializing LightningDiT params) ----
-pretrained_ckpt: ckpts/VOSR_0.5B_ms/checkpoints/ema_model.safetensors
 
 # ---- DINOv2 (frozen, extracts LR semantic features for DiT Cross-Attention) ----
 dinov2:

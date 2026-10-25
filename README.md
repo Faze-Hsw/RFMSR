@@ -58,9 +58,9 @@ huggingface-cli download frozen2001/RFMSR ckpts --local-dir .
 
 | File | Description |
 |------|-------------|
-| `rfmsr.safetensors` | Phase I — multi-step Flow Matching model |
-| `rfmsr_os.safetensors` | Phase II — one-step model |
-| `rfmsr_consistency.safetensors` | Consistency distillation — one-step model |
+| `RFMSR_0.5B/rfmsr.safetensors` | Phase I — multi-step Flow Matching model |
+| `RFMSR_0.5B/rfmsr_os.safetensors` | Phase II — one-step model |
+| `RFMSR_0.5B/rfmsr_consistency.safetensors` | Consistency distillation — one-step model |
 
 ### Data Preparation
 
@@ -100,7 +100,7 @@ python train_rfmsr_os.py
 Key configuration in `configs/train_rfmsr_os.yaml`:
 - Losses: velocity supervision + LPIPS (VGG) + Hinge GAN
 - PatchGAN discriminator in 4-channel latent space
-- Initialized from `ckpts/rfmsr.safetensors`
+- Initialized from `ckpts/RFMSR_0.5B/rfmsr.safetensors`
 - Validation runs both 1-step and 15-step inference for comparison
 
 
@@ -124,7 +124,7 @@ python infer_rfmsr.py --input ./test_images/ --scale 4.0 --steps 15
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--input` | (required) | Input image or directory |
-| `--rfmsr_path` | `ckpts/rfmsr_os.safetensors` | Path to RFMSR checkpoint |
+| `--rfmsr_path` | `ckpts/RFMSR_0.5B/rfmsr_os.safetensors` | Path to RFMSR checkpoint |
 | `--scale` | 4.0 | Upscale factor |
 | `--steps` | 15 | Reverse integration steps (1 for one-step) |
 | `--flow_sigma` | 1.0 | Noise standard deviation |

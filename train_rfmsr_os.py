@@ -29,11 +29,12 @@ from safetensors.torch import save_file as safe_save
 from tqdm import tqdm
 from PIL import Image
 
-from diffusers import AutoencoderKL
 from datapipe.train_dataloader import create_train_dataloader
 from models.rfmsr import create_rfmsr
 from models.dinov2_encoder import create_dinov2_encoder
+from models.latent_codec import create_latent_codec
 from utils import GANLoss, LPIPSLoss, create_discriminator
+from utils.config_loader import load_config
 
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -51,11 +52,10 @@ warnings.filterwarnings("ignore", message=".*None of the inputs have requires_gr
 
 class RFMSROneStepTrainer:
 
-    def __init__(self, resume_path: str = None):
+    def __init__(self, resume_path: str = None, config_path=None, backbone=None):
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(_script_dir, "configs", "train_rfmsr_os.yaml")
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.cfg = yaml.safe_load(f)
+        _cfg_path = config_path or os.path.join(_script_dir, "configs", "train_rfmsr_os.yaml")
+        self.cfg = load_config(_cfg_path, root=_script_dir, backbone=backbone, verbose=True)
 
         self.resume_path = resume_path
         self.device = torch.device(self.cfg["denoise_device"])
@@ -126,13 +126,12 @@ class RFMSROneStepTrainer:
         torch.cuda.manual_seed_all(seed)
 
     def _load_vae(self):
-        vae_path = self.cfg["vae_path"]
-        device = self.device
-        print(f"Loading SD2.1 VAE from {vae_path} -> {device} ...")
-        self.ae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae")
-        self.ae = self.ae.to(device).eval()
-        self.ae.requires_grad_(False)
-        print(f"✅ VAE loaded, scaling_factor={self.ae.config.scaling_factor}")
+        ae_cfg = dict(self.cfg.get("ae") or {})
+        ae_cfg["path"] = self.cfg.get("vae_path") or ae_cfg.get("path")
+        print(f"Loading {ae_cfg.get('type', 'sd2')} VAE from {ae_cfg['path']} -> {self.device} ...")
+        self.codec = create_latent_codec(ae_cfg, device=self.device)
+        self.latent_channels = self.codec.latent_channels
+        print(f"✅ VAE loaded: {self.codec}")
 
     def _load_dinov2(self):
         dv2_cfg = self.cfg.get("dinov2", {}) or {}
@@ -250,6 +249,7 @@ class RFMSROneStepTrainer:
         accum = self.accumulation_steps
         print("\n" + "=" * 60)
         print(f"Experiment      : {self.cfg['experiment']['name']}")
+        print(f"Backbone        : {self.cfg.get('backbone_name', '-')} (latent {self.latent_channels}ch)")
         print(f"Save dir        : {self.exp_dir}")
         print(f"Iterations      : {tcfg['iterations']}")
         print(f"Batch size      : {dcfg['batch_size']}")
@@ -278,30 +278,25 @@ class RFMSROneStepTrainer:
 
     @torch.no_grad()
     def vae_encode(self, img: torch.Tensor) -> torch.Tensor:
-        """[B,3,H,W] float [0,1] → [B,4,H/8,W/8] SD2.1 latent (scaled)."""
+        """[B,3,H,W] float [0,1] -> [B,C,H/8,W/8] normalized latent."""
         img = img.to(device=self.device, dtype=torch.bfloat16)
         img = img * 2.0 - 1.0
-        return self.ae.encode(img.float()).latent_dist.sample() * self.ae.config.scaling_factor
+        return self.codec.encode(img.float())
 
     def vae_decode(self, latent: torch.Tensor) -> torch.Tensor:
-        """[B,4,H/8,W/8] scaled latent → [B,3,H,W] float [0,1].
+        """[B,C,H/8,W/8] normalized latent -> [B,3,H,W] float [0,1].
         Caller should wrap with torch.no_grad() as needed."""
-        s = self.ae.config.scaling_factor
-        decoded = self.ae.decode((latent / s).float()).sample
+        decoded = self.codec.decode(latent.float())
         return torch.clamp((decoded + 1.0) / 2.0, 0.0, 1.0)
 
     def vae_decode_checkpointed(self, latent: torch.Tensor) -> torch.Tensor:
         """Gradient-checkpointed VAE decode for LPIPS training.
         Trade compute for memory: discard VAE decoder intermediate activations,
         recompute forward during backward, saving 80%+ VAE decoder VRAM."""
-        s = self.ae.config.scaling_factor
-        latent = latent / s
-
-        def _decode(l):
-            return self.ae.decode(l).sample
+        z_vae = self.codec.denormalize(latent).float()
 
         decoded = torch.utils.checkpoint.checkpoint(
-            _decode, latent.float(), use_reentrant=False
+            self.codec.decode_vae, z_vae, use_reentrant=False
         )
         return torch.clamp((decoded + 1.0) / 2.0, 0.0, 1.0)
 
@@ -539,8 +534,7 @@ class RFMSROneStepTrainer:
                 v = self.rfmsr(x, t_tensor, z_lr, venc_fea=venc_fea).float()
             x = x - v * dt   # Euler step: x_{t-dt} = x_t - v·dt
         # VAE decode
-        SCALE = self.ae.config.scaling_factor
-        decoded = self.ae.decode((x / SCALE).float()).sample
+        decoded = self.codec.decode(x.float())
         return torch.clamp((decoded + 1.0) / 2.0, 0.0, 1.0)
 
     def _compute_val_metrics(self, sr_decoded, gt_tensor, metrics_dict):
@@ -584,7 +578,6 @@ class RFMSROneStepTrainer:
 
         out_base = self.exp_dir / "validation" / f"step_{step:08d}"
         MOD_PIXEL = 16
-        SCALE = self.ae.config.scaling_factor
 
         lq_paths = sorted(lq_dir.glob("*.png"))
         pairs = []
@@ -629,7 +622,7 @@ class RFMSROneStepTrainer:
                     im_cond = F.pad(im_cond, (0, pad_w, 0, pad_h), mode="reflect")
 
                 image_tensor = im_cond * 2.0 - 1.0
-                z_lr = self.ae.encode(image_tensor.float()).latent_dist.sample() * SCALE
+                z_lr = self.codec.encode(image_tensor.float())
 
                 venc_fea = None
                 if self.use_dinov2 and self.venc is not None:
@@ -852,9 +845,11 @@ class RFMSROneStepTrainer:
 def main():
     parser = argparse.ArgumentParser(description="Train RFMSR One-Step (T=1→0, L2+LPIPS+GAN)")
     parser.add_argument("--resume", type=str, default=None, help="Path to training state checkpoint")
+    parser.add_argument("--config", type=str, default=None, help="Experiment config (default: configs/train_rfmsr_os.yaml)")
+    parser.add_argument("--backbone", type=str, default=None, help="Backbone config, e.g. configs/backbones/rfmsr_1.4b.yaml")
     args = parser.parse_args()
 
-    trainer = RFMSROneStepTrainer(resume_path=args.resume)
+    trainer = RFMSROneStepTrainer(resume_path=args.resume, config_path=args.config, backbone=args.backbone)
     if args.resume:
         trainer.load_checkpoint(args.resume)
     trainer.train()

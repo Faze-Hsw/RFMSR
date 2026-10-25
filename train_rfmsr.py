@@ -34,10 +34,11 @@ from safetensors.torch import save_file as safe_save
 from tqdm import tqdm
 from PIL import Image
 
-from diffusers import AutoencoderKL
 from datapipe.train_dataloader import create_train_dataloader
 from models.rfmsr import create_rfmsr
 from models.dinov2_encoder import create_dinov2_encoder
+from models.latent_codec import create_latent_codec
+from utils.config_loader import load_config
 
 # CUDA optimizations
 torch.set_float32_matmul_precision("high")
@@ -52,11 +53,10 @@ torch.backends.cudnn.benchmark = True
 
 class RFMSRTrainer:
 
-    def __init__(self, resume_path: str = None):
+    def __init__(self, resume_path: str = None, config_path=None, backbone=None):
         _script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(_script_dir, "configs", "train_rfmsr.yaml")
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.cfg = yaml.safe_load(f)
+        _cfg_path = config_path or os.path.join(_script_dir, "configs", "train_rfmsr.yaml")
+        self.cfg = load_config(_cfg_path, root=_script_dir, backbone=backbone, verbose=True)
 
         self.resume_path = resume_path
         self.device = torch.device(self.cfg["denoise_device"])
@@ -124,15 +124,14 @@ class RFMSRTrainer:
         torch.cuda.manual_seed_all(seed)
 
     def _load_vae(self):
-        """Load SD2.1 VAE encoder/decoder (frozen)."""
-        vae_path = self.cfg["vae_path"]
-        device = self.device
+        """Load frozen VAE encoder/decoder (type driven by backbone config)."""
+        ae_cfg = dict(self.cfg.get("ae") or {})
+        ae_cfg["path"] = self.cfg.get("vae_path") or ae_cfg.get("path")
 
-        print(f"Loading SD2.1 VAE from {vae_path} -> {device} ...")
-        self.ae = AutoencoderKL.from_pretrained(vae_path, subfolder="vae")
-        self.ae = self.ae.to(device).eval()
-        self.ae.requires_grad_(False)
-        print(f"✅ VAE loaded, scaling_factor={self.ae.config.scaling_factor}")
+        print(f"Loading {ae_cfg.get('type', 'sd2')} VAE from {ae_cfg['path']} -> {self.device} ...")
+        self.codec = create_latent_codec(ae_cfg, device=self.device)
+        self.latent_channels = self.codec.latent_channels
+        print(f"✅ VAE loaded: {self.codec}")
 
     def _load_dinov2(self):
         """Load frozen DINOv2 semantic encoder."""
@@ -202,6 +201,7 @@ class RFMSRTrainer:
         accum = self.accumulation_steps
         print("\n" + "=" * 60)
         print(f"Experiment      : {self.cfg['experiment']['name']}")
+        print(f"Backbone        : {self.cfg.get('backbone_name', '-')} (latent {self.latent_channels}ch)")
         print(f"Save dir        : {self.exp_dir}")
         print(f"Iterations      : {tcfg['iterations']}")
         print(f"Batch size      : {dcfg['batch_size']}")
@@ -235,10 +235,10 @@ class RFMSRTrainer:
 
     @torch.no_grad()
     def vae_encode(self, img: torch.Tensor) -> torch.Tensor:
-        """[B,3,H,W] float [0,1] → [B,4,H/8,W/8] SD2.1 latent (scaled)."""
+        """[B,3,H,W] float [0,1] -> [B,C,H/8,W/8] normalized latent."""
         img = img.to(device=self.device, dtype=torch.bfloat16)
         img = img * 2.0 - 1.0
-        return self.ae.encode(img.float()).latent_dist.sample() * self.ae.config.scaling_factor
+        return self.codec.encode(img.float())
 
     # ------------------------------------------------------------------
     # Training step
@@ -397,7 +397,6 @@ class RFMSRTrainer:
         out_dir = self.exp_dir / "validation" / f"step_{step:08d}"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        SCALE = self.ae.config.scaling_factor
         MOD_PIXEL = 16
 
         lq_paths = sorted(lq_dir.glob("*.png"))
@@ -442,7 +441,7 @@ class RFMSRTrainer:
 
             # ---- VAE encode ----
             image_tensor = im_cond * 2.0 - 1.0
-            z_lr = self.ae.encode(image_tensor.float()).latent_dist.sample() * SCALE
+            z_lr = self.codec.encode(image_tensor.float())
 
             # ---- DINOv2 features ----
             venc_fea = None
@@ -465,8 +464,7 @@ class RFMSRTrainer:
                 x = x + dt * v
 
             # ---- VAE decode ----
-            latent = x / SCALE
-            sr_decoded = self.ae.decode(latent).sample
+            sr_decoded = self.codec.decode(x)
             sr_decoded = torch.clamp((sr_decoded + 1.0) / 2.0, 0.0, 1.0)
             sr_decoded = sr_decoded[:, :, 0:ori_h, 0:ori_w]
 
@@ -645,9 +643,11 @@ class RFMSRTrainer:
 def main():
     parser = argparse.ArgumentParser(description="Train RFMSR (LightningDiT)")
     parser.add_argument("--resume", type=str, default=None, help="Path to training state checkpoint")
+    parser.add_argument("--config", type=str, default=None, help="Experiment config (default: configs/train_rfmsr.yaml)")
+    parser.add_argument("--backbone", type=str, default=None, help="Backbone config, e.g. configs/backbones/rfmsr_1.4b.yaml")
     args = parser.parse_args()
 
-    trainer = RFMSRTrainer(resume_path=args.resume)
+    trainer = RFMSRTrainer(resume_path=args.resume, config_path=args.config, backbone=args.backbone)
     if args.resume:
         trainer.load_checkpoint(args.resume)
     trainer.train()
