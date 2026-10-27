@@ -308,6 +308,11 @@ class RFMSRTrainer:
         ckpt_dir = self.exp_dir / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+        # Free space from old checkpoints before writing the new one: keep one slot
+        # less than the final target, so the directory holds keep_last_n afterwards
+        if self.keep_last_n > 0:
+            self._cleanup_old_checkpoints(ckpt_dir, keep=max(self.keep_last_n - 1, 0))
+
         # Inference weights (safetensors)
         weights = self.ema_state if self.ema_state is not None else self.rfmsr.state_dict()
         ema_path = ckpt_dir / f"rfmsr_step{step}.safetensors"
@@ -324,12 +329,9 @@ class RFMSRTrainer:
         torch.save(state, state_path)
         print(f"💾 Checkpoint saved: step {step}")
 
-        # Clean up old checkpoints
-        if self.keep_last_n > 0:
-            self._cleanup_old_checkpoints(ckpt_dir)
-
-    def _cleanup_old_checkpoints(self, ckpt_dir: Path):
-        """Keep only the last N checkpoints, delete the rest."""
+    def _cleanup_old_checkpoints(self, ckpt_dir: Path, keep: int = None):
+        """Keep only the newest `keep` checkpoint steps (default: keep_last_n)."""
+        keep = self.keep_last_n if keep is None else keep
         import re
         # Collect all checkpoint files, grouped by step
         pattern = re.compile(r"(rfmsr_step|training_state_step)(\d+)")
@@ -340,9 +342,9 @@ class RFMSRTrainer:
                 s = int(m.group(2))
                 ckpt_steps.setdefault(s, []).append(f)
 
-        # Sort by step, delete old checkpoints beyond keep_last_n
+        # Sort by step, delete old checkpoints beyond `keep`
         sorted_steps = sorted(ckpt_steps.keys(), reverse=True)
-        for step in sorted_steps[self.keep_last_n:]:
+        for step in sorted_steps[keep:]:
             for f in ckpt_steps[step]:
                 f.unlink()
             print(f"🗑️  Removed old checkpoint: step {step}")

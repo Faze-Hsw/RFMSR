@@ -160,7 +160,9 @@ class RFMSROneStepTrainer:
         disc_cfg = self.cfg["discriminator"]
         self.discriminator = create_discriminator(
             disc_type=disc_cfg.get("type", "patch"),
-            input_nc=4,                          # Latent space 4 channels
+            # Latent-space discriminator: channel count must match the VAE
+            # (SD = 4ch, Qwen-Image = 16ch). Allow YAML override if needed.
+            input_nc=disc_cfg.get("input_nc", self.latent_channels),
             ndf=disc_cfg.get("ndf", 64),
             n_layers=disc_cfg.get("n_layers", 3),
             norm_type=disc_cfg.get("norm_type", "spectral"),
@@ -317,7 +319,7 @@ class RFMSROneStepTrainer:
         lr = batch["lq"].to(device)
 
         # 1. VAE encode
-        z_hr = self.vae_encode(hr).detach().float()   # [B, 4, H/8, W/8]
+        z_hr = self.vae_encode(hr).detach().float()   # [B, C_lat, H/8, W/8]
         lr_up = F.interpolate(lr, size=hr.shape[-2:], mode="bicubic", align_corners=False)
         z_lr = self.vae_encode(lr_up).detach().float()
         B = z_hr.shape[0]
@@ -383,9 +385,16 @@ class RFMSROneStepTrainer:
                 total = total + self.l2_weight * l2_loss
            
             if self.gan_weight > 0:
-                d_fake = self.discriminator(z_pred)
-                gan_g_loss = self.gan_loss_fn(d_fake, target_is_real=True, is_disc=False)
-                total = total + self.gan_weight * gan_g_loss
+                # freeze D so gradients only flow to z_pred
+                for p in self.discriminator.parameters():
+                    p.requires_grad_(False)
+                try:
+                    d_fake = self.discriminator(z_pred)
+                    gan_g_loss = self.gan_loss_fn(d_fake, target_is_real=True, is_disc=False)
+                    total = total + self.gan_weight * gan_g_loss
+                finally:
+                    for p in self.discriminator.parameters():
+                        p.requires_grad_(True)
 
             # ---- ② Ground-truth velocity supervision: v_true = z_lr - z_hr + sigma*epsilon ----
             if self.velo_weight > 0:
@@ -456,6 +465,11 @@ class RFMSROneStepTrainer:
         ckpt_dir = self.exp_dir / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+        # Free space from old checkpoints before writing the new one: keep one slot
+        # less than the final target, so the directory holds keep_last_n afterwards
+        if self.keep_last_n > 0:
+            self._cleanup_old_checkpoints(ckpt_dir, keep=max(self.keep_last_n - 1, 0))
+
         # Inference weights (safetensors)
         weights = self.ema_state if self.ema_state is not None else self.rfmsr.state_dict()
         ema_path = ckpt_dir / f"rfmsr_os_step{step}.safetensors"
@@ -474,10 +488,9 @@ class RFMSROneStepTrainer:
         torch.save(state, state_path)
         print(f"💾 Checkpoint saved: step {step}")
 
-        if self.keep_last_n > 0:
-            self._cleanup_old_checkpoints(ckpt_dir)
-
-    def _cleanup_old_checkpoints(self, ckpt_dir: Path):
+    def _cleanup_old_checkpoints(self, ckpt_dir: Path, keep: int = None):
+        """Keep only the newest `keep` checkpoint steps (default: keep_last_n)."""
+        keep = self.keep_last_n if keep is None else keep
         import re
         pattern = re.compile(r"(rfmsr_os_step|training_state_step)(\d+)")
         ckpt_steps: dict[int, list[Path]] = {}
@@ -488,7 +501,7 @@ class RFMSROneStepTrainer:
                 ckpt_steps.setdefault(s, []).append(f)
 
         sorted_steps = sorted(ckpt_steps.keys(), reverse=True)
-        for step in sorted_steps[self.keep_last_n:]:
+        for step in sorted_steps[keep:]:
             for f in ckpt_steps[step]:
                 f.unlink()
             print(f"🗑️  Removed old checkpoint: step {step}")
@@ -721,14 +734,24 @@ class RFMSROneStepTrainer:
             bar_format="{desc} [{n:>6d}/{total_fmt}] {percentage:3.0f}% |{bar}| {postfix} [{rate_fmt}]",
         )
 
-        # EMA stats
+        # log stats (since last print)
         ema_velo = 0.0; ema_l2 = 0.0; ema_lpips = 0.0
         ema_gan_g = 0.0; ema_gan_d = 0.0
         ema_cnt_g = 0; ema_cnt_d = 0
 
-        # Independent G/D gradient accumulation counters
+        # progress-bar stats (current accumulation window)
+        win_velo = 0.0; win_l2 = 0.0; win_lpips = 0.0
+        win_gan_g = 0.0; win_gan_d = 0.0
+        win_cnt_g = 0; win_cnt_d = 0
+        # last finished window
+        bar_g: dict[str, float] = {}
+        bar_d: dict[str, float] = {}
+        # losses are already scaled by accum_steps
+        loss_rescale = float(accum_steps)
+
+        # G/D accumulation counters
         g_count = 0; d_count = 0
-        # G/D alternating batch-level counter (unaffected by accumulation; restarts from 0 on resume)
+        # G/D alternation counter
         batch_idx = 0
 
         self.optimizer_g.zero_grad()
@@ -751,10 +774,13 @@ class RFMSROneStepTrainer:
 
                 loss_dict = self.train_step(batch, train_disc=train_d)
 
-                # EMA & accumulate
+                # Accumulate into both windows: log window (ema_*) and
+                # progress-bar window (win_*, reset at each optimizer step)
                 if train_d:
                     ema_gan_d += loss_dict.get("D", 0)
                     ema_cnt_d += 1
+                    win_gan_d += loss_dict.get("D", 0)
+                    win_cnt_d += 1
                     d_count += 1
                 else:
                     ema_velo += loss_dict.get("Velo", 0)
@@ -762,6 +788,11 @@ class RFMSROneStepTrainer:
                     ema_lpips += loss_dict.get("LPIPS", 0)
                     ema_gan_g += loss_dict.get("GAN_G", 0)
                     ema_cnt_g += 1
+                    win_velo += loss_dict.get("Velo", 0)
+                    win_l2 += loss_dict.get("L2", 0)
+                    win_lpips += loss_dict.get("LPIPS", 0)
+                    win_gan_g += loss_dict.get("GAN_G", 0)
+                    win_cnt_g += 1
                     g_count += 1
 
                 # ---- G/D independent gradient accumulation ----
@@ -772,8 +803,17 @@ class RFMSROneStepTrainer:
                         torch.nn.utils.clip_grad_norm_(self.rfmsr.parameters(), self.grad_clip)
                     self.optimizer_g.step()
                     self.optimizer_g.zero_grad()
-                    self.optimizer_d.zero_grad()
                     self._update_ema()
+                    # Snapshot the window that just produced this step, then reset
+                    n_g = max(win_cnt_g, 1)
+                    bar_g = {
+                        "Velo": win_velo / n_g * loss_rescale,
+                        "L2": win_l2 / n_g * loss_rescale,
+                        "LPIPS": win_lpips / n_g * loss_rescale,
+                        "G_GAN": win_gan_g / n_g * loss_rescale,
+                    }
+                    win_velo = win_l2 = win_lpips = win_gan_g = 0.0
+                    win_cnt_g = 0
                     g_count = 0
                     self.global_step += 1
                     stepped = True
@@ -781,21 +821,24 @@ class RFMSROneStepTrainer:
                 if d_count >= accum_steps:
                     self.optimizer_d.step()
                     self.optimizer_d.zero_grad()
+                    bar_d = {"D": win_gan_d / max(win_cnt_d, 1) * loss_rescale}
+                    win_gan_d = 0.0
+                    win_cnt_d = 0
                     d_count = 0
                     self.global_step += 1
                     stepped = True
 
                 if stepped:
-                    # Progress bar
+                    # Progress bar: mean over the just-finished accumulation window
                     postfix = {}
-                    if ema_cnt_g > 0:
-                        if ema_velo > 0:
-                            postfix["Velo"] = f"{ema_velo/max(ema_cnt_g,1):.4f}"
-                        postfix["L2"] = f"{ema_l2/max(ema_cnt_g,1):.4f}"
-                        postfix["LPIPS"] = f"{ema_lpips/max(ema_cnt_g,1):.4f}"
-                        postfix["G_GAN"] = f"{ema_gan_g/max(ema_cnt_g,1):.4f}"
-                    if ema_cnt_d > 0:
-                        postfix["D"] = f"{ema_gan_d/max(ema_cnt_d,1):.4f}"
+                    if bar_g:
+                        if self.velo_weight > 0:
+                            postfix["Velo"] = f"{bar_g['Velo']:.4f}"
+                        postfix["L2"] = f"{bar_g['L2']:.4f}"
+                        postfix["LPIPS"] = f"{bar_g['LPIPS']:.4f}"
+                        postfix["G_GAN"] = f"{bar_g['G_GAN']:.4f}"
+                    if bar_d:
+                        postfix["D"] = f"{bar_d['D']:.4f}"
                     pbar.set_postfix(**postfix)
                     pbar.update(1)
 
@@ -806,13 +849,14 @@ class RFMSROneStepTrainer:
                         lr_d = self.optimizer_d.param_groups[0]['lr']
                         parts = [f"step {self.global_step}/{total_iters}"]
                         if ema_cnt_g > 0:
-                            if ema_velo > 0:
-                                parts.append(f"Velo={ema_velo/max(ema_cnt_g,1):.4f}")
-                            parts.append(f"L2={ema_l2/max(ema_cnt_g,1):.4f}")
-                            parts.append(f"LPIPS={ema_lpips/max(ema_cnt_g,1):.4f}")
-                            parts.append(f"G_GAN={ema_gan_g/max(ema_cnt_g,1):.4f}")
+                            n_g = max(ema_cnt_g, 1)
+                            if self.velo_weight > 0:
+                                parts.append(f"Velo={ema_velo/n_g*loss_rescale:.4f}")
+                            parts.append(f"L2={ema_l2/n_g*loss_rescale:.4f}")
+                            parts.append(f"LPIPS={ema_lpips/n_g*loss_rescale:.4f}")
+                            parts.append(f"G_GAN={ema_gan_g/n_g*loss_rescale:.4f}")
                         if ema_cnt_d > 0:
-                            parts.append(f"D={ema_gan_d/max(ema_cnt_d,1):.4f}")
+                            parts.append(f"D={ema_gan_d/max(ema_cnt_d,1)*loss_rescale:.4f}")
                         parts.append(f"lr_g={lr_g:.2e} lr_d={lr_d:.2e}")
                         print("\n[" + "]  [".join(parts))
                         ema_velo = ema_l2 = ema_lpips = ema_gan_g = ema_gan_d = 0.0

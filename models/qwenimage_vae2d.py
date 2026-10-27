@@ -75,7 +75,11 @@ class AttentionBlock2D(nn.Module):
         qkv = qkv.permute(0, 1, 3, 2).contiguous()
 
         q, k, v = qkv.unbind(dim=1)
-        x_attn = F.scaled_dot_product_attention(q, k, v)
+        # 4D single-head layout: the 3D (b, N, c) form is not supported by the
+        # flash/mem-efficient kernels on some accelerators (falls back to O(N^2)
+        # math -> OOM on large inputs). The 4D (b, 1, N, c) form is mathematically
+        # identical but selects the fast, O(N)-memory kernel.
+        x_attn = F.scaled_dot_product_attention(q[:, None], k[:, None], v[:, None])
         x_attn = x_attn.squeeze(1)
 
         x_attn = x_attn.permute(0, 2, 1).reshape(b, c, h, w)
