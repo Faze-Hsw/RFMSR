@@ -336,7 +336,8 @@ class LightningDiT(nn.Module):
         self.depth = depth
         self.hidden_size = hidden_size
         self.use_checkpoint = use_checkpoint
-        self.x_embedder = PatchEmbed(input_size, patch_size, self.in_channels, hidden_size, bias=True)
+        self.x_embedder = PatchEmbed(input_size, patch_size, self.in_channels, hidden_size,
+                                     bias=True, strict_img_size=False)
         self.t_embedder = TimestepEmbedder(hidden_size)
 
         if self.use_rope:

@@ -7,7 +7,7 @@ data:
   hr_dir: traindata/
   degradation_config: configs/realesrgan_degradation.yaml
   gt_size: 512
-  batch_size: 16
+  batch_size: 32
   num_workers: 8
   use_hflip: true
   use_rot: false
@@ -22,7 +22,7 @@ dinov2:
   enabled: true
 
 training:
-  iterations: 10000
+  iterations: 100000
   lr: 5.0e-5
   adam_beta1: 0.9
   adam_beta2: 0.999
@@ -56,12 +56,13 @@ discriminator:
   norm_type: 'spectral'
   lr: 1.0e-4                   # discriminator learning rate
   update_freq: 2               # update discriminator every N effective steps
+  start_iteration: 5000           # adversarial training starts at this effective step
 
 experiment:
   name: rfmsr_os
   save_dir: experiments
-  log_freq: 1000
-  save_freq: 1000
+  log_freq: 5000
+  save_freq: 5000
   keep_last_n: 3
 
 validation:

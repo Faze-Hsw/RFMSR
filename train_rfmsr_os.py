@@ -95,6 +95,9 @@ class RFMSROneStepTrainer:
         # GAN alternating training
         disc_cfg = self.cfg["discriminator"]
         self.disc_update_freq = disc_cfg.get("update_freq", 2)
+        # Adversarial training (both D updates and the generator's GAN loss) starts
+        # only after this many effective steps, so warmup is purely reconstruction
+        self.gan_start_iteration = disc_cfg.get("start_iteration", 0)
 
         # Validation
         self.val_enabled = self.cfg.get("validation", {}).get("enabled", False)
@@ -270,7 +273,8 @@ class RFMSROneStepTrainer:
               + f"LPIPS(w={self.lpips_weight}) + "
               + f"GAN(w={self.gan_weight}, {loss_cfg.get('gan_type','hinge')})")
         print(f"Discriminator   : {disc_cfg.get('type','patch')}, "
-              f"update_freq={self.disc_update_freq}")
+              f"update_freq={self.disc_update_freq}, "
+              f"start_iteration={self.gan_start_iteration}")
         print(f"AMP             : {self.use_amp}")
         print("=" * 60 + "\n")
 
@@ -305,6 +309,10 @@ class RFMSROneStepTrainer:
     # ------------------------------------------------------------------
     # Training step
     # ------------------------------------------------------------------
+
+    def gan_active(self) -> bool:
+        """True once GAN weight is set and global_step reached the warmup boundary."""
+        return self.gan_weight > 0 and self.global_step >= self.gan_start_iteration
 
     def train_step(self, batch: dict, train_disc: bool) -> dict:
         """
@@ -384,7 +392,7 @@ class RFMSROneStepTrainer:
                 l2_loss = F.mse_loss(z_pred, z_hr_fp)
                 total = total + self.l2_weight * l2_loss
            
-            if self.gan_weight > 0:
+            if self.gan_active():
                 # freeze D so gradients only flow to z_pred
                 for p in self.discriminator.parameters():
                     p.requires_grad_(False)
@@ -434,7 +442,7 @@ class RFMSROneStepTrainer:
 
             if self.l2_weight > 0:
                 losses["L2"] = l2_loss.item() * inv_accum
-            if self.gan_weight > 0:
+            if self.gan_active():
                 losses["GAN_G"] = gan_g_loss.item() * inv_accum
             losses["total"] = total.item() * inv_accum
 
@@ -768,8 +776,9 @@ class RFMSROneStepTrainer:
                     data_iter = iter(self.dataloader)
                     batch = next(data_iter)
 
-                # G/D alternating: batch-level (unaffected by accumulation)
-                train_d = (self.gan_weight > 0 and batch_idx % self.disc_update_freq == 0)
+                # G/D alternating: batch-level (unaffected by accumulation);
+                # no discriminator updates before start_iteration
+                train_d = (self.gan_active() and batch_idx % self.disc_update_freq == 0)
                 batch_idx += 1
 
                 loss_dict = self.train_step(batch, train_disc=train_d)

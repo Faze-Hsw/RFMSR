@@ -28,6 +28,27 @@ DINOV2_HUB_NAMES = {
 class Dinov2Encoder(nn.Module):
     """Frozen DINOv2 feature extractor, outputting features from specified intermediate layers."""
 
+    @staticmethod
+    def _list_hub_refs(cache_dir: str) -> list[str]:
+        """Cache suffixes of extracted `facebookresearch_dinov2_<ref>` trees."""
+        return sorted(
+            d.rsplit("facebookresearch_dinov2_", 1)[1]
+            for d in os.listdir(cache_dir)
+            if d.startswith("facebookresearch_dinov2_")
+            and os.path.isdir(os.path.join(cache_dir, d))
+        )
+
+    @classmethod
+    def _resolve_hub_ref(cls, cache_dir: str) -> str:
+        """Pick the hub ref: env override, else the cached tree, else `main`."""
+        env_ref = os.environ.get("DINOV2_HUB_REF")
+        if env_ref:
+            return env_ref
+        refs = cls._list_hub_refs(cache_dir)
+        if not refs:
+            return "main"
+        return "main" if "main" in refs else refs[0]
+
     def __init__(
         self,
         enc_type: str = "dinov2b",
@@ -47,14 +68,39 @@ class Dinov2Encoder(nn.Module):
                 f"expected one of {list(DINOV2_HUB_NAMES)}"
             )
 
-        # Set torch.hub cache directory (consistent with VOSR)
+        # Set torch.hub cache directory
         cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                                  "ckpts", "torch_cache")
         os.makedirs(cache_dir, exist_ok=True)
         torch.hub.set_dir(cache_dir)
 
-        print(f"Loading DINOv2 from torch.hub: facebookresearch/dinov2 → {hub_name} ...")
-        encoder = torch.hub.load('facebookresearch/dinov2', hub_name)
+        # The ref must be spelled out: without it torch.hub asks github.com for the
+        # default branch *before* looking at the cache, which hangs/fails offline.
+        # So derive it from the local cache first and only fall back to the network.
+        ref = self._resolve_hub_ref(cache_dir)
+        repo_dir = os.path.join(cache_dir, f"facebookresearch_dinov2_{ref}")
+        if os.path.isdir(repo_dir):
+            print(f"Loading DINOv2 from torch.hub: facebookresearch/dinov2:{ref} "
+                  f"(cache) → {hub_name} ...")
+        else:
+            print(f"[WARN] DINOv2 source not cached at {repo_dir}; downloading from GitHub ...")
+
+        weights = os.path.join(cache_dir, "checkpoints", f"{hub_name}_pretrain.pth")
+        if not os.path.isfile(weights):
+            print(f"[WARN] {weights} missing; torch.hub will try to download it.")
+
+        try:
+            encoder = torch.hub.load(f'facebookresearch/dinov2:{ref}', hub_name, trust_repo=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load DINOv2 ({hub_name}, ref={ref}).\n"
+                f"  hub cache : {cache_dir}\n"
+                f"  refs found: {self._list_hub_refs(cache_dir) or 'none'}\n"
+                f"Populate the cache with:\n"
+                f"  modelscope download --model LULALULALU/VOSR_CKPT "
+                f"--include 'torch_cache/**' --local_dir ckpts\n"
+                f"or point DINOV2_HUB_REF at an existing cache suffix."
+            ) from e
 
         # Remove classification head, replace with Identity
         del encoder.head
