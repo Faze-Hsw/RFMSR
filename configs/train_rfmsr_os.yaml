@@ -14,15 +14,15 @@ data:
 
 denoise_device: cuda
 
-# Must be a checkpoint of matching size when switching backbones
-# (leave empty to fall back to the backbone's pretrained_ckpt).
+# Stage-II init; must match the current backbone size.
+# `~` skips pretrained loading
 pretrained_ckpt: ckpts/RFMSR_0.5B/rfmsr.safetensors
 
 dinov2:
   enabled: true
 
 training:
-  iterations: 100000
+  iterations: 20000
   lr: 5.0e-5
   adam_beta1: 0.9
   adam_beta2: 0.999

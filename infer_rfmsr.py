@@ -70,14 +70,14 @@ class RFMSRInferencer:
 
     # ---- Model loading ----
 
-    def load(self, vae_path=None, rfmsr_path=None, model_config=None, denoise_device=None, backbone=None):
+    def load(self, vae_path=None, rfmsr_path=None, denoise_device=None, backbone=None):
         """Load VAE + RFMSR + DINOv2. CLI args override YAML defaults."""
         _rfmsr = rfmsr_path or RFMSR_PATH
         _device = denoise_device or DENOISE_DEVICE
         self._device = _device
 
-        # backbone is the architecture source; model_config points at a file with dit_arch/dinov2/ae
-        cfg = load_config(model_config or _CONFIG_PATH, root=_SCRIPT_DIR, backbone=backbone)
+        # backbone is the architecture source (dit_arch / ae / dinov2)
+        cfg = load_config(_CONFIG_PATH, root=_SCRIPT_DIR, backbone=backbone)
         _model = cfg.get("model_config") or MODEL_CONFIG
         ae_cfg = dict(cfg.get("ae") or _AE_CFG)
         ae_cfg["path"] = vae_path or ae_cfg.get("path") or VAE_PATH
@@ -352,7 +352,6 @@ def main(
     color_correction: str = COLOR_CORRECTION,
     vae_path: str = None,
     rfmsr_path: str = None,
-    model_config: str = None,
     backbone: str = None,
     denoise_device: str = None,
 ):
@@ -369,9 +368,8 @@ def main(
         tile_size:       Pixel-space tile size
         tile_stride:     Pixel-space stride
         color_correction: Color correction method ('adain', 'wavelet', 'ycbcr', 'none').
-        vae_path:        SD2.1 VAE path (default from config)
+        vae_path:        VAE path override (default from config)
         rfmsr_path:      RFMSR weight path (default from config)
-        model_config:    DiT architecture config path (default from config)
         backbone:        Backbone config path, e.g. configs/backbones/rfmsr_1.4b.yaml
         denoise_device:  Inference device (default from config)
     """
@@ -411,7 +409,7 @@ def main(
     print(f"{'=' * 50}\n")
 
     inferencer = RFMSRInferencer()
-    inferencer.load(vae_path=vae_path, rfmsr_path=rfmsr_path, model_config=model_config,
+    inferencer.load(vae_path=vae_path, rfmsr_path=rfmsr_path,
                     denoise_device=denoise_device, backbone=backbone)
 
     out_root = Path(output)
